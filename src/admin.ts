@@ -718,6 +718,7 @@ export async function handleCreateModelGroup(c: Context<{ Bindings: Env }>) {
     name: body.name || body.id,
     enabled: true,
     members: [...new Set(body.members)],
+    multimodal: body.multimodal === true,
   }
   await saveModelGroup(c.env, group)
   return c.json<ApiResponse>({ success: true, data: group, message: '模型组已创建' }, 201)
@@ -757,6 +758,7 @@ export async function handleUpdateModelGroup(c: Context<{ Bindings: Env }>) {
     name: body.name !== undefined ? body.name : existing.name,
     enabled: body.enabled !== undefined ? body.enabled : existing.enabled,
     members: nextMembers,
+    multimodal: body.multimodal !== undefined ? body.multimodal === true : existing.multimodal,
   }
   await saveModelGroup(c.env, updated)
   return c.json<ApiResponse>({ success: true, data: updated, message: '模型组已更新' })

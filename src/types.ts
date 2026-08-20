@@ -46,6 +46,8 @@ export interface ModelGroup {
   name: string
   enabled: boolean
   members: string[]
+  // 多模态分组标记：标识此模型组用于视觉/图片/视频等多模态任务，供管理端与外部系统(如 Hermes auxiliary.vision)识别
+  multimodal?: boolean
 }
 
 export interface Session {
