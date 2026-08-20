@@ -743,8 +743,8 @@ function renderModelGrid(models, editId, providerId) {
     var safeId = escapeHtml(modelId)
     // 动态模型 ID 必须作为 JSON 字符串参数进入 inline handler，并先做 HTML escaping；
     // 禁止把未经 JS escaping 的远端模型 ID 直接拼入 onclick。
-    var jsModelId = escapePageHtml(JSON.stringify(modelId).replace(/\\u2028/g, '\\\\u2028').replace(/\\u2029/g, '\\\\u2029'))
-    var jsEditId = escapePageHtml(JSON.stringify(editId || '').replace(/\\u2028/g, '\\\\u2028').replace(/\\u2029/g, '\\\\u2029'))
+    var jsModelId = escapeHtml(JSON.stringify(modelId).replace(/\\u2028/g, '\\\\u2028').replace(/\\u2029/g, '\\\\u2029'))
+    var jsEditId = escapeHtml(JSON.stringify(editId || '').replace(/\\u2028/g, '\\\\u2028').replace(/\\u2029/g, '\\\\u2029'))
     var addFn = editId
       ? 'addMdlToEdit(' + jsEditId + ',' + jsModelId + ')'
       : 'addMdlToForm(' + jsModelId + ')'
