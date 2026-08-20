@@ -72,7 +72,7 @@ export const DEFAULT_PROVIDERS: Provider[] = [
     name: 'OpenCode',
     baseUrl: 'https://opencode.ai/zen/v1',
     apiType: 'openai',
-    apiKeys: [],
+    apiKeys: [{ key: 'public', enabled: true }],
     models: [
       { id: 'deepseek-v4-flash-free', enabled: true },
       { id: 'mimo-v2.5-free', enabled: true },
