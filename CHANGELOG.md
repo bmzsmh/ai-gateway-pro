@@ -10,6 +10,7 @@ Full-round audit of the freshly deployed standalone project surfaced 6 issues; a
 - **C4 (fix regression)**: OPTIONS CORS preflight is now handled before the proxy-key auth middleware, so a configured CORS preflight returns 204 instead of 401.
 - **C5 (consistency)**: provider creation now uses the same strict `normalizeApiKeys()` as updates (length/trim/empty-key filtering), removing the create-vs-update asymmetry.
 - **C6 (harden, IPv6)**: SSRF `validateBaseUrl()` now also blocks IPv6 private ULA (`fd00::/8`), link-local (`fe80::/10`) and — only for internal ranges — IPv4-mapped IPv6 (`::ffff:10.x`, `::ffff:192.168.x`, etc.), while still allowing public IPv4-mapped addresses. (DNS-resolution-after-parse check remains infeasible on Workers.)
+- **Branding**: updated site author from `QingYun` to `小鸢`, repo URL from `yutian81/ai-gateway` to `bmzsmh/ai-gateway-pro`, title from `AI Gateway` to `AI Gateway Pro`.
 
 
 - `model` request field runtime validation: added length cap (300) and `SAFE_RESOURCE_ID_RE`/`SAFE_MODEL_ID_RE` format checking in `parseModelId()` — same regexes already used at admin creation time, so no legitimate model is rejected.
