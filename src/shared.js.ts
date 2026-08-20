@@ -40,15 +40,29 @@ function showResult(el, success, msg) {
 }
 
 // ── API 请求函数 ──
+// fetchJSON 带客户端超时兜底，避免任何情况下"测试中..."无限转圈
+async function fetchJSON(url, opts, timeoutMs) {
+  var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null
+  var t = ctrl ? setTimeout(function() { ctrl.abort() }, timeoutMs || 25000) : null
+  try {
+    var r = await fetch(url, opts && ctrl ? Object.assign({}, opts, { signal: ctrl.signal }) : (opts || {}))
+    var d = await r.json()
+    return { ok: r.ok, data: d }
+  } catch (e) {
+    return { ok: false, data: null, error: e }
+  } finally {
+    if (t) clearTimeout(t)
+  }
+}
 async function testKeyConnection(url, apiType, key, providerId) {
   try {
-    var r = await fetch('/admin/api/test-key', {
+    var r = await fetchJSON('/admin/api/test-key', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, providerId: providerId })
-    })
-    var d = await r.json()
-    if (d.success && d.data) {
+    }, 25000)
+    var d = r.data
+    if (r.ok && d && d.success && d.data) {
       return { success: d.data.success, status: d.data.statusCode, data: d.data.data, message: d.data.message }
     }
     return { success: false, status: 0, data: null }
@@ -58,13 +72,13 @@ async function testKeyConnection(url, apiType, key, providerId) {
 }
 async function testModelConnection(url, apiType, key, modelId, providerId) {
   try {
-    var r = await fetch('/admin/api/test-model', {
+    var r = await fetchJSON('/admin/api/test-model', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: url, apiKey: key, apiType: apiType, model: modelId, providerId: providerId })
-    })
-    var d = await r.json()
-    if (d.success && d.data) {
+    }, 25000)
+    var d = r.data
+    if (r.ok && d && d.success && d.data) {
       return { success: d.data.success, status: d.data.statusCode }
     }
     return { success: false, status: 0 }
