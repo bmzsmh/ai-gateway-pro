@@ -720,8 +720,8 @@ function handleModels() {
 
 function getApiKey(request, env) {
   const provided = env.API_KEY;
-  // 未配置 API_KEY → 使用内置默认 key
-  const expected = provided !== undefined && provided !== null && provided !== "" ? provided : "cline2api-default-key";
+  // 未配置 API_KEY → 返回 null（fail-closed，配合顶部 503 双重兜底）
+  const expected = provided !== undefined && provided !== null && provided !== "" ? provided : null;
 
   const auth = request.headers.get("Authorization") || "";
   if (auth.startsWith("Bearer ")) {

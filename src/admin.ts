@@ -50,7 +50,8 @@ function validateBaseUrl(value: unknown): value is string {
   try {
     const url = new URL(value)
     if (url.protocol !== 'https:' && url.protocol !== 'http:') return false
-    const host = url.hostname.toLowerCase()
+    const hostRaw = url.hostname.toLowerCase()
+    const host = hostRaw.startsWith('[') && hostRaw.endsWith(']') ? hostRaw.slice(1, -1) : hostRaw
     if (
       host === 'localhost'
       || host === 'localhost.localdomain'
@@ -62,7 +63,39 @@ function validateBaseUrl(value: unknown): value is string {
       || /^10\./.test(host)
       || /^192\.168\./.test(host)
       || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+      // C6 修复：IPv6 私有/链路本地/映射地址补漏
+      || /^fd[0-9a-f]{2}:/i.test(host)       // fd00::/8 ULA
+      || /^fe[89ab][0-9a-f]:/i.test(host)    // fe80::/10 链路本地
     ) return false
+    // C6 修复：IPv4-mapped IPv6 (::ffff:a.b.c.d 或 Node 规范化的 ::ffff:hexi:hexj)
+    // 仅拦内网映射，公网映射放行
+    const mappedMatch = /^::ffff:((?:\d+\.){3}\d+|(?:[0-9a-f]{1,4}:){1,2}[0-9a-f]{1,4})$/.exec(host)
+    if (mappedMatch) {
+      let ipv4: string | null = null
+      const mapped = mappedMatch[1]
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(mapped)) {
+        ipv4 = mapped
+      } else {
+        // 十六进制分组还原 IPv4：1-2 组 hex，每组分高低 8 位
+        const hexParts = mapped.split(':').map(p => parseInt(p, 16))
+        const bytes: number[] = []
+        for (let i = 0; i < hexParts.length; i++) {
+          bytes.push((hexParts[i] >> 8) & 0xff, hexParts[i] & 0xff)
+        }
+        ipv4 = bytes.join('.')
+      }
+      if (ipv4) {
+        const v4 = ipv4
+        if (
+          /^127\./.test(v4)
+          || /^10\./.test(v4)
+          || /^192\.168\./.test(v4)
+          || /^172\.(1[6-9]|2\d|3[0-1])\./.test(v4)
+          || v4 === '169.254.169.254'
+          || v4 === '0.0.0.0'
+        ) return false
+      }
+    }
     return true
   } catch {
     return false
@@ -209,6 +242,13 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
   if (body.apiType && body.apiType !== 'openai' && body.apiType !== 'anthropic') {
     return c.json<ApiResponse>({ success: false, message: 'apiType 必须是 openai 或 anthropic' }, 400)
   }
+  // C2 修复：校验 groupId 是否存在
+  if (body.groupId) {
+    const g = await getModelGroup(c.env, body.groupId)
+    if (!g) {
+      return c.json<ApiResponse>({ success: false, message: `目标模型组 "${body.groupId}" 不存在，请先创建该模型组` }, 400)
+    }
+  }
 
   const providers = await getProviders(c.env)
   if (providers.some((p) => p.id === body.id)) {
@@ -221,7 +261,7 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
     name: body.name,
     baseUrl: normalizeProviderBaseUrl(body.baseUrl),
     apiType: body.apiType || 'openai',
-apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
+apiKeys: normalizeApiKeys(body.apiKeys),
     models: body.models ? normalizeModels(body.models) : [],
     enabled: body.enabled !== undefined ? body.enabled : true,
     status: body.status || 'pending',
@@ -662,6 +702,16 @@ export async function handleCreateModelGroup(c: Context<{ Bindings: Env }>) {
   }
   if (await hasGroupCycle(c.env, body.id, body.members)) {
     return c.json<ApiResponse>({ success: false, message: '模型组引用形成循环依赖' }, 400)
+  }
+  // C3 修复：校验 members 中的 provider 引用是否存在（排除 group/ 嵌套组）
+  const providers = await getProviders(c.env)
+  const providerIds = new Set(providers.map(p => p.id))
+  for (const member of body.members) {
+    if (member.startsWith('group/')) continue // 嵌套组引用，稍后由 hasGroupCycle 校验
+    const providerId = member.split('/')[0]
+    if (!providerIds.has(providerId)) {
+      return c.json<ApiResponse>({ success: false, message: `成员 "${member}" 引用的提供商 "${providerId}" 不存在` }, 400)
+    }
   }
   const group: ModelGroup = {
     id: body.id,

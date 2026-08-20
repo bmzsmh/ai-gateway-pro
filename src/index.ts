@@ -47,6 +47,16 @@ app.use('*', async (c, next) => {
   const origins = raw.split(',').map(v => v.trim()).filter(Boolean)
   return cors({ origin: origins })(c, next)
 })
+// C4 修复：OPTIONS 预检在 auth 之前处理，避免被 proxyKeyAuthMiddleware 拦截
+app.use('/v1/*', async (c, next) => {
+  if (c.req.method === 'OPTIONS') {
+    const raw = c.env.CORS_ORIGINS?.trim()
+    if (!raw) return next()
+    const origins = raw.split(',').map(v => v.trim()).filter(Boolean)
+    return cors({ origin: origins })(c, next)
+  }
+  return next()
+})
 app.use('*', logger())
 
 // 首次请求时填充初始数据；用 Promise 防止同一 isolate 的并发首请求重复 seed。

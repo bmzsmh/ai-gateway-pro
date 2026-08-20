@@ -1,6 +1,16 @@
 # Changelog
 
-## 1.2.2 — Stability fixes (no functional change)
+## 1.2.3 — Harden & fix audit findings (2026-08-20)
+
+Full-round audit of the freshly deployed standalone project surfaced 6 issues; all fixed in this release:
+
+- **C1 (hardening)**: removed the built-in default API key `cline2api-default-key` fallback in `worker-proxy/cline.js` — `getApiKey()` now returns `null` when `API_KEY` is unset (true fail-closed, matching the top-level 503 guard; removes the leftover hardcoded credential from the pre-audit relaxed design).
+- **C2 (harden)**: `POST /admin/api/providers` now validates `groupId` exists before accepting a provider assigned to it (previously silently accepted a nonexistent group).
+- **C3 (harden)**: `POST /admin/api/model-groups` now validates that provider members exist (nested `group/` members are resolved separately); dangling provider refs are rejected.
+- **C4 (fix regression)**: OPTIONS CORS preflight is now handled before the proxy-key auth middleware, so a configured CORS preflight returns 204 instead of 401.
+- **C5 (consistency)**: provider creation now uses the same strict `normalizeApiKeys()` as updates (length/trim/empty-key filtering), removing the create-vs-update asymmetry.
+- **C6 (harden, IPv6)**: SSRF `validateBaseUrl()` now also blocks IPv6 private ULA (`fd00::/8`), link-local (`fe80::/10`) and — only for internal ranges — IPv4-mapped IPv6 (`::ffff:10.x`, `::ffff:192.168.x`, etc.), while still allowing public IPv4-mapped addresses. (DNS-resolution-after-parse check remains infeasible on Workers.)
+
 
 - `model` request field runtime validation: added length cap (300) and `SAFE_RESOURCE_ID_RE`/`SAFE_MODEL_ID_RE` format checking in `parseModelId()` — same regexes already used at admin creation time, so no legitimate model is rejected.
 - Precise error classification: replaced string-prefix guessing with dedicated `PayloadTooLargeError` / `InvalidJsonError` classes matched via `instanceof`; unclassified internal errors now correctly return 500 instead of being misreported as client 400.
