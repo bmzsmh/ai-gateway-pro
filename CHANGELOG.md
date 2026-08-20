@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.4 — Model group management UI with multimodal flag (2026-08-20)
+
+- **New "模型组" admin section**: standalone navigation tab in the admin panel listing all model groups with create/edit/delete/toggle UI.
+- **Multimodal flag**: `ModelGroup` now supports an optional `multimodal: boolean` field. Groups can be tagged as mobile (视觉/图片/视频) via the admin panel toggle. The field is persisted in KV and exposed via the API for external systems (e.g. Hermes `auxiliary.vision`) to identify which groups serve visual tasks.
+- **Member model selection**: admin UI shows available models from all providers as clickable chips; clicking one adds it to the group's member list. Supports both `provider/model` references and nested `group/subgroup` references.
+- **Toggle multimodal**: each group card has a dedicated on/off switch for the multimodal flag, with immediate API update and visual feedback (icon + tag).
+- **Routing unchanged**: `group/xxx` API routing behaviour is identical; the multimodal flag is exclusively for admin and external system consumption.
+
 ## 1.2.3 — Harden & fix audit findings (2026-08-20)
 
 Full-round audit of the freshly deployed standalone project surfaced 6 issues; all fixed in this release:
