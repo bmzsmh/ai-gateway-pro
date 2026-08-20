@@ -1,0 +1,29 @@
+name = "ai-gateway-pro"
+main = "src/index.ts"
+compatibility_date = "2025-07-01"
+compatibility_flags = ["nodejs_compat"]
+keep_vars = true
+
+# KV namespace - 生产环境
+# 请替换 <YOUR_PROD_KV_NAMESPACE_ID> 为你的实际生产 KV namespace ID
+# 也可以通过 GitHub Actions vars.KV_NAMESPACE_ID 注入（见 .github/workflows/deploy.yml）
+[[kv_namespaces]]
+binding = "KV"
+id = "<YOUR_PROD_KV_NAMESPACE_ID>"
+
+# Admin credentials（生产环境）
+# 不要把 ADMIN_USERNAME / ADMIN_PASSWORD 写入 wrangler.toml。
+# 推荐：
+#   npx wrangler secret put ADMIN_USERNAME
+#   npx wrangler secret put ADMIN_PASSWORD
+
+# Optional runtime variables
+[vars]
+# REQUEST_TIMEOUT_MS = "120000"
+# MAX_REQUEST_BODY_BYTES = "5242880"
+# CORS_ORIGINS = "https://your-console.example.com"
+
+# OpenCode public mirror fallback is OFF by default.
+# Only enable it when you explicitly accept the third-party data boundary:
+# OPENCODE_MIRROR_FALLBACK = "true"
+# OPENCODE_MIRRORS_URL = "https://your-mirror.example/v1"

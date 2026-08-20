@@ -1,0 +1,21 @@
+name = "ai-gateway-pro-test"
+main = "src/index.ts"
+compatibility_date = "2025-07-01"
+compatibility_flags = ["nodejs_compat"]
+keep_vars = true
+
+# KV namespace - 测试环境独立
+# 请替换 <YOUR_TEST_KV_NAMESPACE_ID> 为你的实际测试 KV namespace ID
+[[kv_namespaces]]
+binding = "KV"
+id = "<YOUR_TEST_KV_NAMESPACE_ID>"
+
+# Admin credentials：推荐使用 secret put，不写入配置文件。
+# npx wrangler secret put ADMIN_USERNAME --env test
+# npx wrangler secret put ADMIN_PASSWORD --env test
+
+[vars]
+# REQUEST_TIMEOUT_MS = "120000"
+# MAX_REQUEST_BODY_BYTES = "5242880"
+# OPENCODE_MIRROR_FALLBACK = "false"
+# OPENCODE_MIRRORS_URL = "https://your-mirror.example/v1"

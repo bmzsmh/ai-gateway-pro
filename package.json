@@ -1,0 +1,28 @@
+{
+  "name": "ai-gateway-pro",
+  "version": "1.2.2",
+  "description": "Cloudflare Workers AI API Gateway",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit",
+    "build": "wrangler deploy --dry-run",
+    "deploy": "wrangler deploy"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "ai",
+    "proxy",
+    "api-gateway"
+  ],
+  "license": "Apache 2.0",
+  "dependencies": {
+    "hono": "^4.12.27"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260815.1",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.107.0"
+  }
+}

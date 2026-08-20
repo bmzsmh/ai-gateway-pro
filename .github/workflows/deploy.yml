@@ -1,0 +1,56 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  workflow_dispatch: # 允许手动触发
+  # push:
+  #   branches:
+  #     - main
+
+# 部署所需权限
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy Worker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate wrangler.toml
+        run: |
+          cat > wrangler.toml << EOF
+          name = "ai-gateway-pro"
+          main = "src/index.ts"
+          compatibility_date = "2025-07-01"
+          compatibility_flags = ["nodejs_compat"]
+          keep_vars = true
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "${{ vars.KV_NAMESPACE_ID }}"
+          EOF
+          echo "Admin credentials are managed as Cloudflare Secrets, not GitHub Variables."
+          echo "OpenCode public mirror fallback is opt-in via OPENCODE_MIRROR_FALLBACK=true."
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build (dry-run)
+        run: npm run build
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
