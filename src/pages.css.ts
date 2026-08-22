@@ -313,6 +313,14 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .switch-label { min-height: var(--control-h); display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); }
 .gp, .provider-list, .key-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-xs); }
 .group-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-xs); }
+.group-sections { display: grid; gap: var(--space-md); }
+.group-section { display: grid; gap: var(--space-xs); }
+.group-section-heading { display: flex; align-items: center; gap: var(--space-xs); padding: var(--space-2xs) var(--space-2xs) 0; }
+.group-section-heading h3 { margin: 0; font-size: .95rem; display: flex; align-items: center; gap: .375rem; }
+.group-section-heading h3 i { color: var(--color-muted); }
+.group-section-count { font-size: .75rem; color: var(--color-muted); padding: .125rem .5rem; border-radius: 999px; background: var(--color-rule); }
+.group-section .group-list .empty-state { border: .0625rem dashed var(--color-rule); border-radius: var(--radius-control); padding: var(--space-sm); text-align: center; color: var(--color-muted); }
+.group-section .group-list .empty-state i { display: block; font-size: 1.25rem; margin-bottom: .25rem; }
 .gi { min-width: 0; border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); background: var(--color-paper); padding: var(--space-xs); }
 .gi .pi { border: 0; border-radius: 0; background: transparent; }
 .gi .cii { min-width: 0; display: flex; align-items: center; gap: var(--space-xs); }

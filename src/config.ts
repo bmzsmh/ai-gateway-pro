@@ -1,4 +1,4 @@
-import type { Provider } from './types'
+import type { Provider, ModelGroup } from './types'
 
 export const SITE_CONFIG = {
   title: 'AI Gateway Pro',
@@ -83,5 +83,35 @@ export const DEFAULT_PROVIDERS: Provider[] = [
     status: 'active',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+  },
+]
+
+// 默认模型组种子：新部署 KV 首次运行时自动创建三类型基础分组。
+// 与 DEFAULT_PROVIDERS 一样，仅在前端/后台无任何分组数据时写入一次。
+// 成员仅引用 DEFAULT_PROVIDERS 中存在的模型，保证开箱即用。
+export const DEFAULT_MODEL_GROUPS: ModelGroup[] = [
+  {
+    id: 'auto-task',
+    name: '主力模型池',
+    enabled: true,
+    type: 'primary',
+    multimodal: false,
+    members: ['opencode/deepseek-v4-flash-free', 'opencode/nemotron-3-ultra-free'],
+  },
+  {
+    id: 'auto-task-backup',
+    name: '备用模型池',
+    enabled: true,
+    type: 'backup',
+    multimodal: false,
+    members: ['opencode/hy3-free'],
+  },
+  {
+    id: 'vision-pool',
+    name: '多模态模型池',
+    enabled: true,
+    type: 'multimodal',
+    multimodal: true,
+    members: ['opencode/mimo-v2.5-free'],
   },
 ]

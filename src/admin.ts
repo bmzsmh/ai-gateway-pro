@@ -20,6 +20,7 @@ import { testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL, SAFE_RESOURCE_ID_RE, SAFE_MODEL_ID_RE } from './config'
 import { getRequestLog, getLastActive, getUsage } from './telemetry'
+import { getAlertHistory } from './alerts'
 import type {
   Env,
   ApiResponse,
@@ -109,7 +110,7 @@ function normalizeProviderBaseUrl(value: string): string {
 function upstreamV1Url(baseUrl: string, path: string): string {
   const base = normalizeProviderBaseUrl(baseUrl)
   const normalizedPath = path.replace(/^\/+/, '')
-  return `${base}${/\/v1$/i.test(base) ? '' : '/v1'}/${normalizedPath}`
+  return `${base}${/\/v\d+$/i.test(base) ? '' : '/v1'}/${normalizedPath}`
 }
 
 function normalizeApiKeys(items: unknown): Array<{ key: string; enabled: boolean }> {
@@ -214,6 +215,12 @@ export async function handleGetUsage(c: Context<{ Bindings: Env }>) {
   }
   const usage = await getUsage(c.env, providerId, date)
   return c.json<ApiResponse>({ success: true, data: usage })
+}
+
+export async function handleGetAlertHistory(c: Context<{ Bindings: Env }>) {
+  const type = c.req.param('type') || undefined
+  const result = await getAlertHistory(c.env, type)
+  return c.json<ApiResponse>(result)
 }
 
 // ===== 提供商 CRUD =====
@@ -342,6 +349,10 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
   if (body.baseUrl !== undefined) updates.baseUrl = normalizeProviderBaseUrl(body.baseUrl)
   if (body.apiType !== undefined) updates.apiType = body.apiType
 if (body.apiKeys !== undefined) {
+    // 防呆：空数组覆盖 apiKeys 必须带 confirmClearKeys: true（pitfall 31 防护）
+    if (Array.isArray(body.apiKeys) && body.apiKeys.length === 0 && !body.confirmClearKeys) {
+      return c.json<ApiResponse>({ success: false, message: 'apiKeys 为空数组且未设置 confirmClearKeys: true，拒绝覆盖（如确有清空需求，请设置 confirmClearKeys: true）' }, 400)
+    }
     updates.apiKeys = normalizeApiKeys(body.apiKeys)
   }
   if (body.enabled !== undefined) updates.enabled = body.enabled
@@ -718,7 +729,8 @@ export async function handleCreateModelGroup(c: Context<{ Bindings: Env }>) {
     name: body.name || body.id,
     enabled: true,
     members: [...new Set(body.members)],
-    multimodal: body.multimodal === true,
+    type: body.type && ['primary', 'backup', 'multimodal'].includes(body.type) ? body.type : undefined,
+    multimodal: body.multimodal === true || body.type === 'multimodal',
   }
   await saveModelGroup(c.env, group)
   return c.json<ApiResponse>({ success: true, data: group, message: '模型组已创建' }, 201)
@@ -758,7 +770,10 @@ export async function handleUpdateModelGroup(c: Context<{ Bindings: Env }>) {
     name: body.name !== undefined ? body.name : existing.name,
     enabled: body.enabled !== undefined ? body.enabled : existing.enabled,
     members: nextMembers,
-    multimodal: body.multimodal !== undefined ? body.multimodal === true : existing.multimodal,
+    type: body.type !== undefined
+      ? (['primary', 'backup', 'multimodal'].includes(body.type) ? body.type : existing.type)
+      : existing.type,
+    multimodal: body.multimodal !== undefined ? body.multimodal === true : (body.type === 'multimodal' ? true : existing.multimodal),
   }
   await saveModelGroup(c.env, updated)
   return c.json<ApiResponse>({ success: true, data: updated, message: '模型组已更新' })
@@ -787,10 +802,12 @@ export async function handleTestProviderStatus(c: Context<{ Bindings: Env }>) {
 
   if (result.success) {
     await setProviderStatus(c.env, id, 'active', '验证通过')
+    // 将 testProviderStatus 返回的 reason（"x/n key 有效"）透传给前端
+    const reasonMsg = result.reason || ''
     return c.json({
       success: true,
-      data: { status: 'active', reason: '' },
-      message: 'Provider 验证通过，状态已更新为 active',
+      data: { status: 'active', reason: reasonMsg },
+      message: 'Provider 验证通过，状态已更新为 active' + (reasonMsg ? `（${reasonMsg}）` : ''),
     })
   } else {
     await setProviderStatus(c.env, id, 'pending', result.reason)

@@ -26,6 +26,7 @@ import {
   handleGetTelemetryLog,
   handleGetLastActive,
   handleGetUsage,
+  handleGetAlertHistory,
 } from './admin'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
 import { seedInitialData, getSession } from './storage'
@@ -119,6 +120,9 @@ app.delete('/admin/api/model-groups/:id', handleDeleteModelGroup)
 app.get('/admin/api/telemetry/log/:providerId', handleGetTelemetryLog)
 app.get('/admin/api/telemetry/last-active', handleGetLastActive)
 app.get('/admin/api/telemetry/usage/:providerId', handleGetUsage)
+// 告警历史查询
+app.get('/admin/api/alerts', handleGetAlertHistory)
+app.get('/admin/api/alerts/:type', handleGetAlertHistory)
 
 // ===== API 转发路由（需转发 Key 验证） =====
 app.use('/v1/*', proxyKeyAuthMiddleware)

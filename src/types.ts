@@ -46,6 +46,9 @@ export interface ModelGroup {
   name: string
   enabled: boolean
   members: string[]
+  // 分组类型：第一梯队(primary) / 第二梯队(backup) / 多模态(multimodal)
+  // type 替代隐式命名约定，让梯队分类显式表达；旧数据无 type 时按 multimodal 推导
+  type?: 'primary' | 'backup' | 'multimodal'
   // 多模态分组标记：标识此模型组用于视觉/图片/视频等多模态任务，供管理端与外部系统(如 Hermes auxiliary.vision)识别
   multimodal?: boolean
 }
@@ -84,6 +87,7 @@ export interface UpdateProviderRequest {
   baseUrl?: string
   apiType?: 'openai' | 'anthropic'
   apiKeys?: Array<{ key: string; enabled: boolean }>
+  confirmClearKeys?: boolean  // 显式确认清空 apiKeys，否则空数组不覆盖
   models?: Array<{ id: string; enabled: boolean }> | string[]
   enabled?: boolean
   status?: ProviderStatus
@@ -112,4 +116,6 @@ export interface Env {
   REQUEST_TIMEOUT_MS?: string
   MAX_REQUEST_BODY_BYTES?: string
   CORS_ORIGINS?: string
+  TG_BOT_TOKEN?: string
+  TG_CHAT_ID?: string
 }

@@ -13,17 +13,32 @@ const escapePageHtml = (value: unknown) => String(value ?? '')
   .replace(/"/g, '&quot;')
   .replace(/'/g, '&#39;')
 
-// 渲染可用模型 chips（点击添加到成员列表）
+// 渲染可用模型（按提供商分组展示，每行一个提供商+其模型列表）
 function renderAvailableModels(providers: Array<{ id: string; name: string; models: Array<{ id: string; enabled?: boolean }> }>): string {
-  const chips: string[] = []
+  if (!providers.length) return '<p class="form-helper">暂无可用模型，请先在「提供商」中添加。</p>'
+  const rows: string[] = []
   for (const p of providers) {
-    for (const m of p.models) {
-      if (m.enabled === false) continue
+    const enabledModels = p.models.filter(m => m.enabled !== false)
+    if (!enabledModels.length) continue
+    const modelsHtml = enabledModels.map(m => {
       const ref = `${p.id}/${m.id}`
-      chips.push(`<button type="button" class="chip chip-model chip-avail" data-ref="${escapePageHtml(ref)}" onclick="addAvailToGroup('${escapePageHtml(ref)}')">${escapePageHtml(ref)}</button>`)
-    }
+      return `<button type="button" class="model-token" onclick="addAvailToGroup('${escapePageHtml(ref)}')" title="点击添加到成员列表"><code>${escapePageHtml(ref)}</code></button>`
+    }).join('')
+    rows.push(`<article class="provider-row">
+      <div class="provider-row__identity">
+        <span class="provider-row__mark" aria-hidden="true">${escapePageHtml(p.name.charAt(0).toUpperCase() || '?')}</span>
+        <div>
+          <h3>${escapePageHtml(p.name)}</h3>
+          <p><code>${escapePageHtml(p.id)}</code> | <span>${enabledModels.length} 个模型</span></p>
+        </div>
+      </div>
+      <div class="provider-row__models">
+        ${modelsHtml}
+      </div>
+      <span class="status-badge status-badge--on" style="justify-self:end"><i aria-hidden="true"></i>已启用</span>
+    </article>`)
   }
-  return chips.length ? chips.join('') : '<p class="form-helper">暂无可用模型，请先在「提供商」中添加。</p>'
+  return rows.length ? rows.join('') : '<p class="form-helper">暂无可用模型，请先在「提供商」中添加。</p>'
 }
 
 const H = (title: string) => `
@@ -381,7 +396,6 @@ ${H('管理')}
             <fieldset class="form-group"><legend>上游 API Keys</legend><div id="akeys"><div class="fc mb-4 field-row"><input type="text" placeholder="sk-xxx" class="fx1 aki" aria-label="上游 API Key"><label class="tg" title="启用 Key"><input type="checkbox" checked class="ake" aria-label="启用 Key"><span class="sl"></span></label><button class="icon-btn" onclick="copyRowVal(this)" title="复制 Key" aria-label="复制 Key"><i class="far fa-copy" aria-hidden="true"></i></button><button class="icon-btn" onclick="testNewAKey(this)" title="测试 Key" aria-label="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i></button><button class="icon-btn" onclick="this.parentElement.remove()" title="移除 Key" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s" onclick="addAKeyRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加 Key</button></fieldset>
             <aside id="amc" class="hd mdl-list-panel"><div class="panel-heading"><div><span class="panel-heading__mark"><i class="fas fa-cube" aria-hidden="true"></i></span><div><h3>可用模型</h3><p>点击“+”添加到配置。</p></div></div><button class="icon-btn" type="button" onclick="hideMdlPanel('amc')" title="关闭可用模型" aria-label="关闭可用模型"><i class="fas fa-times" aria-hidden="true"></i></button></div><div id="amcl"></div></aside>
             <fieldset class="form-group"><legend>模型 ID</legend><div id="amodels"><div class="fc mb-4 field-row"><input type="text" placeholder="deepseek-chat" class="fx1 ami" aria-label="模型 ID"><label class="tg" title="启用模型"><input type="checkbox" checked class="ame" aria-label="启用模型"><span class="sl"></span></label><button class="icon-btn" onclick="copyRowVal(this)" title="复制模型 ID" aria-label="复制模型 ID"><i class="far fa-copy" aria-hidden="true"></i></button><button class="icon-btn" onclick="testNewMdl(this)" title="测试模型" aria-label="测试模型"><i class="fas fa-plug" aria-hidden="true"></i></button><button class="icon-btn" onclick="this.parentElement.remove()" title="移除模型" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div></div><button class="btn btn-s" onclick="addMdlRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加模型</button></fieldset>
-            <fieldset class="form-group"><legend>加入梯队</legend><div class="fr"><div class="fg"><label for="agroup">目标模型组</label><select id="agroup"><option value="">不加入梯队</option>${modelGroups.map(g=>`<option value="${escapePageHtml(g.id)}">${escapePageHtml(g.name)}（${escapePageHtml(g.id)}）</option>`).join('')}</select></div><div class="fg"><label for="atier">梯队级别</label><select id="atier"><option value="primary">一梯队（主力）</option><option value="backup">二梯队（备用）</option></select></div></div><p class="form-helper">新建 provider 默认 pending，需调用 test-status 验证通过后才能被路由使用。选梯队只是决定验证通过后进哪个梯队。</p></fieldset>
             <div class="panel-actions"><label class="switch-label"><span>创建后立即启用</span><span class="tg"><input type="checkbox" checked id="aen"><span class="sl"></span></span></label><div><button class="btn btn-s" onclick="hideAdd()">取消</button><button class="btn btn-p" onclick="createProv()"><i class="fas fa-check" aria-hidden="true"></i>创建提供商</button></div></div>
             <div id="atestR" class="mt-1" aria-live="polite"></div>
           </div>
@@ -401,7 +415,6 @@ ${H('管理')}
               <div class="fg"><label>API 格式</label><select id="at-${escapePageHtml(p.id)}" class="select-sm"><option value="openai" ${(p.apiType||'openai')==='openai'?'selected':''}>OpenAI 兼容</option><option value="anthropic" ${p.apiType==='anthropic'?'selected':''}>Anthropic 兼容</option></select></div>
               <fieldset class="form-group"><legend>上游 API Keys</legend><div id="keys-${escapePageHtml(p.id)}">${p.apiKeys.map((k, ki)=>`<div class="fc mb-3 field-row" data-kidx="${ki}"><input type="text" value="${escapePageHtml(k.key)}" class="fx1" id="k-${escapePageHtml(p.id)}-${ki}" placeholder="API Key" aria-label="API Key"><label class="tg"><input type="checkbox" ${k.enabled?'checked':''} id="ken-${escapePageHtml(p.id)}-${ki}" aria-label="启用 Key"><span class="sl"></span></label><button class="icon-btn" onclick="copyRowVal(this)" title="复制 Key" aria-label="复制 Key"><i class="far fa-copy" aria-hidden="true"></i></button><button class="icon-btn" onclick="testKeyRow('${p.id}',${ki})" title="测试 Key" aria-label="测试 Key"><i class="fas fa-plug" aria-hidden="true"></i></button><button class="icon-btn" onclick="rmKeyRow('${p.id}',${ki})" title="移除 Key" aria-label="移除 Key"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nk-${escapePageHtml(p.id)}" placeholder="新的 API Key" class="fx1"><button class="btn btn-s" onclick="addKeyRow('${p.id}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div></fieldset>
               <fieldset class="form-group"><legend>模型</legend><div id="ml-${escapePageHtml(p.id)}">${p.models.map((m,mi)=>`<div class="fc mb-3 field-row" data-idx="${mi}"><input type="text" value="${escapePageHtml(m.id)}" class="fx1" id="mid-${escapePageHtml(p.id)}-${mi}" placeholder="模型 ID"><label class="tg"><input type="checkbox" ${m.enabled?'checked':''} id="men-${escapePageHtml(p.id)}-${mi}" aria-label="启用模型"><span class="sl"></span></label><button class="icon-btn" onclick="copyRowVal(this)" title="复制模型 ID" aria-label="复制模型 ID"><i class="far fa-copy" aria-hidden="true"></i></button><button class="icon-btn" onclick="testMdl('${p.id}','${m.id}',${mi})" title="测试模型" aria-label="测试模型"><i class="fas fa-plug" aria-hidden="true"></i></button><button class="icon-btn" onclick="rmMdl('${p.id}',${mi})" title="移除模型" aria-label="移除模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>`).join('')}</div><div class="fc mt-1 field-row"><input type="text" id="nmid-${escapePageHtml(p.id)}" placeholder="新的模型 ID" class="fx1"><button class="btn btn-s" onclick="addMdl('${p.id}')"><i class="fas fa-plus" aria-hidden="true"></i>添加</button></div></fieldset>
-              <fieldset class="form-group"><legend>梯队（编辑后自动迁移）</legend><div class="fr"><div class="fg"><label>目标模型组</label><select id="eg-${escapePageHtml(p.id)}"><option value="">不加入梯队</option>${modelGroups.map(g=>`<option value="${escapePageHtml(g.id)}" ${p.groupId===g.id?'selected':''}>${escapePageHtml(g.name)}（${escapePageHtml(g.id)}）</option>`).join('')}</select></div><div class="fg"><label>梯队级别</label><select id="et-${escapePageHtml(p.id)}"><option value="primary" ${p.tier==='primary'?'selected':''}>一梯队（主力）</option><option value="backup" ${p.tier==='backup'?'selected':''}>二梯队（备用）</option></select></div></div><p class="form-helper">选择梯队并保存后，会将此提供商从原梯队移除并加入新梯队（含所有模型引用），同时写回此提供商的梯队信息。</p></fieldset>
               <div class="detail-actions"><div id="tr-${escapePageHtml(p.id)}" aria-live="polite"></div><div>${p.id === 'opencode' ? '<button class="btn btn-s" onclick="fetchEditModels(\'' + p.id + '\')"><i class="fas fa-download" aria-hidden="true"></i>获取模型</button>' : ''}<button class="btn btn-d" onclick="del('${p.id}')"><i class="fas fa-trash" aria-hidden="true"></i>删除</button><button class="btn btn-p" onclick="save('${p.id}')"><i class="fas fa-save" aria-hidden="true"></i>保存更改</button></div></div>
             </div>
           </article>`).join('') : `<div class="empty-state"><i class="fas fa-server" aria-hidden="true"></i><h3>还没有提供商</h3><p>添加第一个上游提供商，配置 API 地址、Key 和模型。</p><button class="btn btn-p" onclick="showAdd()">添加提供商</button></div>`}
@@ -421,7 +434,10 @@ ${H('管理')}
               <div class="fg"><label for="agn">名称</label><input type="text" id="agn" placeholder="视觉模型池"></div>
               <div class="fg"><label for="agi">分组 ID</label><input type="text" id="agi" placeholder="vision-pool"><span class="form-helper">用于模型前缀 group/xxx，创建后不可修改。</span></div>
             </div>
-            <div class="fg"><label for="agi-enabled">启用状态</label><label class="switch-label"><span>创建后立即启用</span><span class="tg"><input type="checkbox" checked id="agien"><span class="sl"></span></span></label></div>
+            <div class="fr">
+              <div class="fg"><label for="agtype">分组类型</label><select id="agtype" onchange="if(this.value==='multimodal'){document.getElementById('agmm').checked=true}else if(!document.getElementById('agmm').checked){document.getElementById('agmm').checked=false}"><option value="primary">第一梯队（主力）</option><option value="backup">第二梯队（备用）</option><option value="multimodal">多模态</option></select></div>
+              <div class="fg"><label for="agi-enabled">启用状态</label><label class="switch-label"><span>创建后立即启用</span><span class="tg"><input type="checkbox" checked id="agien"><span class="sl"></span></span></label></div>
+            </div>
             <div class="fg"><label for="agmultimodal">多模态分组</label><label class="switch-label"><span>用于视觉/图片/视频等多模态任务</span><span class="tg"><input type="checkbox" id="agmm"><span class="sl"></span></span></label></div>
             <fieldset class="form-group"><legend>成员模型</legend><div id="agmembers"><div class="fc mb-3 field-row"><input type="text" placeholder="agnes/agnes-2.5-flash" class="fx1 agmi" aria-label="成员模型"></div></div><button class="btn btn-s" onclick="addAGMemberRow()"><i class="fas fa-plus" aria-hidden="true"></i>添加成员</button> <span class="form-helper">也可在下方从「可用模型」快速勾选。</span></fieldset>
             <fieldset class="form-group"><legend>可用模型（点击添加）</legend><div id="agavail">${renderAvailableModels(providers)}</div></fieldset>
@@ -430,10 +446,13 @@ ${H('管理')}
           </div>
         </div>
 
-        <div class="group-list" id="group-list">
-          ${modelGroups.length===0?'<div class="empty-state"><i class="fas fa-layer-group" aria-hidden="true"></i><h3>暂无模型组</h3><p>创建模型组后，可通过 <code>group/分组ID</code> 调用。</p><button class="btn btn-p" onclick="showAddGroup()">创建模型组</button></div>':''}
-          ${modelGroups.map((g) => `
-          <article class="gi" data-id="${escapePageHtml(g.id)}" data-name="${escapePageHtml(g.name)}" data-multimodal="${g.multimodal?'1':'0'}">
+        <div class="group-sections">
+          ${[['primary','第一梯队','fa-bolt'],['backup','第二梯队','fa-shield-alt'],['multimodal','多模态','fa-eye']].map(([tKey,tLabel,tIcon])=>`
+          <section class="group-section" data-section-type="${tKey}">
+            <div class="group-section-heading"><h3><i class="fas ${tIcon}" aria-hidden="true"></i>${tLabel}</h3><span class="group-section-count">${modelGroups.filter(g=>(g.type||(g.multimodal?'multimodal':'primary'))===tKey).length} 组</span></div>
+            <div class="group-list" data-list-type="${tKey}">
+              ${modelGroups.filter(g=>(g.type||(g.multimodal?'multimodal':'primary'))===tKey).map((g) => `
+          <article class="gi" data-id="${escapePageHtml(g.id)}" data-name="${escapePageHtml(g.name)}" data-multimodal="${g.multimodal?'1':'0'}" data-type="${escapePageHtml(g.type||'')}">
             <div class="pi">
               <div class="cii">
                 <div class="ci-ico"><i class="fas ${g.multimodal?'fa-eye':'fa-layer-group'}" aria-hidden="true"></i></div>
@@ -454,6 +473,9 @@ ${H('管理')}
               </div>
             </div>
           </article>`).join('')}
+              ${modelGroups.filter(g=>(g.type||(g.multimodal?'multimodal':'primary'))===tKey).length===0?'<div class="empty-state"><i class="fas fa-layer-group" aria-hidden="true"></i><p>暂无该类型分组</p></div>':''}
+            </div>
+          </section>`).join('')}
         </div>
       </section>
 
@@ -472,8 +494,9 @@ ${H('管理')}
         </div>
 
         <div class="mon-grid" id="mon-active-grid" aria-label="当前活跃模型">
-          <div class="mon-active-card"><h4>一梯队（auto-task）</h4><div class="mon-active-body mon-active-empty" id="mon-active-auto-task">加载中…</div></div>
-          <div class="mon-active-card"><h4>二梯队（auto-task-backup）</h4><div class="mon-active-body mon-active-empty" id="mon-active-auto-task-backup">加载中…</div></div>
+          <div class="mon-active-card"><h4>第一梯队（主力）</h4><div class="mon-active-body mon-active-empty" id="mon-active-primary">加载中…</div></div>
+          <div class="mon-active-card"><h4>第二梯队（备用）</h4><div class="mon-active-body mon-active-empty" id="mon-active-backup">加载中…</div></div>
+          <div class="mon-active-card"><h4>多模态</h4><div class="mon-active-body mon-active-empty" id="mon-active-multimodal">加载中…</div></div>
         </div>
 
         <div class="mon-controls">
@@ -506,6 +529,8 @@ ${H('管理')}
 <div id="modal" class="modal-o hd" role="presentation" onclick="if(event.target===this)closeM()"><div class="modal" id="mc" role="dialog" aria-modal="true" aria-live="polite"></div></div>
 
 <script>${SHARED_JS}
+// 内嵌模型组数据：监控页按 type 动态渲染活跃状态卡片（primary/backup/multimodal）
+const EMBED_MODEL_GROUPS = ${JSON.stringify(modelGroups.map(g => ({ id: g.id, type: g.type || (g.multimodal ? 'multimodal' : 'primary'), enabled: g.enabled !== false })))};
 // copy
 function copyText(t, el) {
   const i = el.tagName === 'I' ? el : (el.querySelector('i') || el.parentElement?.querySelector('i'))
@@ -560,9 +585,11 @@ function aM(msg, t) {
 
 function toast(msg, t) {
   const el = document.getElementById('toast')
-  const i = t === 'success' ? 'fa-check-circle' : 'fa-times-circle'
-  const cls = t === 'success' ? 'al-s' : 'al-e'
-  el.innerHTML = '<div class="al ' + cls + '"><i class="fas ' + i + '"></i> ' + escapeHtml(msg) + '</div>'
+  let icon = 'fa-times-circle', cls = 'al-e'
+  if (t === 'success') { icon = 'fa-check-circle'; cls = 'al-s' }
+  else if (t === 'info') { icon = 'fa-info-circle'; cls = 'al-i' }
+  else if (t === 'warning') { icon = 'fa-exclamation-triangle'; cls = 'al-i' }
+  el.innerHTML = '<div class="al ' + cls + '"><i class="fas ' + icon + '"></i> ' + escapeHtml(msg) + '</div>'
   el.classList.remove('hd')
   setTimeout(() => el.classList.add('hd'), 3000)
 }
@@ -580,9 +607,10 @@ function hideAdd() { document.getElementById('af').classList.add('hd'); document
 // ===== 模型组管理 =====
 function showAddGroup() {
   document.getElementById('agf').classList.remove('hd')
-  document.getElementById('agi').removeAttribute('disabled')
   document.getElementById('agi').value = ''
+  document.getElementById('agi').removeAttribute('disabled')
   document.getElementById('agn').value = ''
+  document.getElementById('agtype').value = 'primary'
   document.getElementById('agien').checked = true
   document.getElementById('agmm').checked = false
   document.getElementById('agmembers').innerHTML = '<div class="fc mb-3 field-row"><input type="text" placeholder="provider/model" class="fx1 agmi" aria-label="成员模型"></div>'
@@ -601,13 +629,14 @@ function addAvailToGroup(ref) {
     if (first) first.value = ref
   } else {
     members.insertAdjacentHTML('beforeend', '<div class="fc mb-3 field-row"><input type="text" value="" class="fx1 agmi" aria-label="成员模型"></div>')
-    const last = members.querySelector('.agmi:last-of-type')
-    if (last) last.value = ref
+    const all = members.querySelectorAll('.agmi')
+    if (all.length) all[all.length - 1].value = ref
   }
 }
 async function createGroup() {
   const id = document.getElementById('agi').value.trim()
   const name = document.getElementById('agn').value.trim()
+  const type = document.getElementById('agtype').value
   const enabled = document.getElementById('agien').checked
   const multimodal = document.getElementById('agmm').checked
   if (!id) { toast('请填写分组 ID', 'error'); return }
@@ -616,7 +645,7 @@ async function createGroup() {
   const r = await fetch('/admin/api/model-groups', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id, name, enabled, members, multimodal })
+    body: JSON.stringify({ id, name, enabled, members, type, multimodal })
   })
   const d = await r.json()
   if (d.success) { toast('模型组已创建'); hideAddGroup(); refreshGroups() }
@@ -659,8 +688,9 @@ function editGroup(id) {
   document.getElementById('agi').value = id
   document.getElementById('agi').setAttribute('disabled', 'disabled')
   document.getElementById('agn').value = name
+  document.getElementById('agtype').value = (gi.dataset.type && ['primary','backup','multimodal'].includes(gi.dataset.type)) ? gi.dataset.type : (gi.dataset.multimodal === '1' ? 'multimodal' : 'primary')
   document.getElementById('agien').checked = true
-  document.getElementById('agmm').checked = gi.dataset.multimodal === '1'
+  document.getElementById('agmm').checked = gi.dataset.multimodal === '1' || gi.dataset.type === 'multimodal'
   document.getElementById('agmembers').innerHTML = members.map(m => '<div class="fc mb-3 field-row"><input type="text" value="' + m + '" class="fx1 agmi" aria-label="成员模型"><button class="icon-btn" onclick="this.parentElement.remove()" title="移除"><i class="fas fa-times"></i></button></div>').join('') || '<div class="fc mb-3 field-row"><input type="text" placeholder="provider/model" class="fx1 agmi" aria-label="成员模型"></div>'
   document.getElementById('agtestR').innerHTML = '<p class="form-helper">编辑模式：修改成员后点「保存模型组」。</p>'
   // 临时保存原 ID 供保存用
@@ -675,13 +705,14 @@ async function saveGroup() {
   const id = window.__editGroupId
   if (!id) return
   const name = document.getElementById('agn').value.trim()
+  const type = document.getElementById('agtype').value
   const multimodal = document.getElementById('agmm').checked
   const members = Array.from(document.querySelectorAll('#agmembers .agmi')).map(i => i.value.trim()).filter(Boolean)
   if (members.length === 0) { toast('请至少保留一个成员模型', 'error'); return }
   const r = await fetch('/admin/api/model-groups/' + encodeURIComponent(id), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, members, multimodal })
+    body: JSON.stringify({ name, members, type, multimodal })
   })
   const d = await r.json()
   if (d.success) { toast('模型组已更新'); hideAddGroup(); refreshGroups() }
@@ -849,7 +880,23 @@ async function createProv() {
     body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, apiKeys: keys, models, enabled, groupId, tier })
   })
   const d = await r.json()
-  if (d.success) { toast('已创建', 'success'); location.reload() }
+  if (d.success) {
+    // 创建成功后自动验证：有 key 且非 opencode（opencode 无 key 也能用）
+    if (keys.length > 0) {
+      toast('正在验证连接…', 'info')
+      try {
+        const vr = await fetch('/admin/api/providers/' + encodeURIComponent(id) + '/test-status', { method: 'POST' })
+        const vd = await vr.json()
+        if (vd.success) toast('创建成功，连接验证通过 ✓', 'success')
+        else toast('创建成功，但连接验证失败: ' + (vd.message || vd.data?.reason || '未知错误'), 'warning')
+      } catch {
+        toast('创建成功，但验证请求失败', 'warning')
+      }
+    } else {
+      toast('已创建', 'success')
+    }
+    location.reload()
+  }
   else toast(d.message || '创建失败', 'error')
 }
 
@@ -1201,8 +1248,28 @@ async function loadLog(providerId) {
   }
 }
 function refreshMonitoring() {
-  loadLastActive('group/auto-task', 'mon-active-auto-task')
-  loadLastActive('group/auto-task-backup', 'mon-active-auto-task-backup')
+  // 按类型渲染活跃状态卡片
+  const types = [
+    { type: 'primary', el: 'mon-active-primary', label: '第一梯队（主力）' },
+    { type: 'backup', el: 'mon-active-backup', label: '第二梯队（备用）' },
+    { type: 'multimodal', el: 'mon-active-multimodal', label: '多模态' }
+  ]
+  types.forEach(function (t) {
+    const groups = (EMBED_MODEL_GROUPS || []).filter(g => g.type === t.type && g.enabled)
+    const el = document.getElementById(t.el)
+    if (!el) return
+    if (groups.length === 0) {
+      el.classList.add('mon-active-empty')
+      el.textContent = '暂无 ' + t.label + ' 分组'
+      return
+    }
+    // 该类型下多个分组：逐个查询，都显示
+    el.classList.remove('mon-active-empty')
+    el.innerHTML = groups.map(g => '<div class="mon-group-row"><strong>' + escapeHtml(g.id) + '</strong><span class="mon-group-last" id="mla-' + t.el + '-' + escapeHtml(g.id) + '">…</span></div>').join('')
+    groups.forEach(function (g) {
+      loadLastActive('group/' + encodeURIComponent(g.id), 'mla-' + t.el + '-' + g.id)
+    })
+  })
   const sel = document.getElementById('mon-provider-select')
   const providerId = sel ? sel.value : ''
   loadUsage(providerId)

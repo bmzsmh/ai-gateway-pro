@@ -14,6 +14,7 @@ import {
 import type { Env, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
 import { recordRequestEvent, updateLastActive, recordUsage, maskKey, type RequestEvent } from './telemetry'
+import { sendAlert, countKvWrite, detectMultimodalFailure, hasImageContent, type AlertType } from './alerts'
 
 interface KeyHealth {
   failures: number
@@ -52,15 +53,32 @@ function getMaxBodyBytes(env: Env): number {
   return getPositiveInt(env.MAX_REQUEST_BODY_BYTES, DEFAULT_MAX_REQUEST_BODY_BYTES, 20 * 1024 * 1024)
 }
 
+/** Key 健康度内存缓存：isolate 级 Map，短 TTL（5s）。读时先查内存命中则省一次 KV 读；
+ *  写入仍同步 await 写 KV（不改为 waitUntil 异步，避免更新丢失），同时同步更新内存缓存，
+ *  本 isolate 内后续请求立刻可见。跨 isolate 最多 5s 不一致窗口，个人场景可接受。
+ *  注意：内存 Map 会随 isolate 生命周期回收，低流量时命中率可能不高——收益实测算。 */
+const HEALTH_MEMORY_CACHE_TTL_MS = 5_000
+const healthMemoryCache = new Map<string, { data: HealthMap; expiresAt: number }>()
+
 async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
-  const raw = await env.KV.get(HEALTH_KEY(providerId))
-  if (!raw) return {}
-  try {
-    return JSON.parse(raw) as HealthMap
-  } catch {
-    console.warn(`[health] invalid health data for provider ${providerId}; resetting`)
-    return {}
+  const cached = healthMemoryCache.get(providerId)
+  if (cached && cached.expiresAt > Date.now()) {
+    // console.log(`[health][${providerId}] readHealth: MEMORY`)  // 验证用临时日志（已删）
+    return cached.data
   }
+  const raw = await env.KV.get(HEALTH_KEY(providerId))
+  // console.log(`[health][${providerId}] readHealth: KV`)        // 验证用临时日志（已删）
+  let data: HealthMap = {}
+  if (raw) {
+    try {
+      data = JSON.parse(raw) as HealthMap
+    } catch {
+      console.warn(`[health] invalid health data for provider ${providerId}; resetting`)
+      data = {}
+    }
+  }
+  healthMemoryCache.set(providerId, { data, expiresAt: Date.now() + HEALTH_MEMORY_CACHE_TTL_MS })
+  return data
 }
 
 async function writeHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
@@ -68,8 +86,12 @@ async function writeHealth(env: Env, providerId: string, health: HealthMap): Pro
   for (const [k, v] of Object.entries(health)) {
     if (v.failures > 0 || (v.cooldownUntil && v.cooldownUntil > Date.now())) filtered[k] = v
   }
+  // 先同步更新内存缓存，本 isolate 内后续请求立刻可见
+  healthMemoryCache.set(providerId, { data: filtered, expiresAt: Date.now() + HEALTH_MEMORY_CACHE_TTL_MS })
+  // 同步写 KV（非 waitUntil 异步，避免 isolate 回收时更新丢失）
   if (Object.keys(filtered).length > 0) {
     await env.KV.put(HEALTH_KEY(providerId), JSON.stringify(filtered))
+    await countKvWrite(env)
   } else {
     await env.KV.delete(HEALTH_KEY(providerId)).catch(() => {})
   }
@@ -229,12 +251,15 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       if (!group.enabled) return c.json({ error: { message: `模型组 "${modelId}" 已禁用`, type: 'group_disabled', request_id: requestId } }, 403)
       if (group.members.length === 0) return c.json({ error: { message: `模型组 "${modelId}" 未配置成员模型`, type: 'configuration_error', request_id: requestId } }, 500)
 
+      const isImageReq = hasImageContent(body)
       const activeProviders = await getActiveProviders(c.env)
       const activeProviderIds = new Set(activeProviders.map(p => p.id))
       const primaryMembers = group.members.filter(m => !m.startsWith('group/'))
       const backupGroups = group.members.filter(m => m.startsWith('group/'))
       let lastErr: Response | null = null
       let attempts = 0
+      // 记录进入 backup 的标记（用于 fallback_failure 告警）
+      let wentToBackup = false
 
       const tryMember = async (member: string): Promise<Response | null> => {
         if (attempts >= MAX_TOTAL_GROUP_ATTEMPTS) return null
@@ -261,12 +286,21 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         }
       }
 
+      // —— 主力组全部失败告警（即使 backup 组可能成功） ——
+      if (primaryMembers.length > 0 && backupGroups.length > 0) {
+        safeWaitUntil(c, sendAlert(c.env, 'tier_degrade', `group:${modelId}`,
+          `⚠️ <b>梯队已降级</b>：${modelId} → ${backupGroups.join(', ')}`,
+          `主力组 ${primaryMembers.length} 个成员全部不可用（降权/禁用），请求已自动降级到备用组 ${backupGroups.join(', ')}\n${isImageReq ? '⚠️ 原始请求含图片，备用组可能不支持图片识别' : ''}`
+        ))
+      }
+
       for (const subRef of backupGroups) {
         if (attempts >= MAX_TOTAL_GROUP_ATTEMPTS) break
         const subParsed = parseModelId(subRef)
         if (!subParsed || subParsed.providerId !== 'group') continue
         const subGroup = await getModelGroup(c.env, subParsed.modelId)
         if (!subGroup?.enabled || subGroup.members.length === 0) continue
+        wentToBackup = true
         const subPrimary = subGroup.members.filter(m => !m.startsWith('group/'))
         const subStart = subPrimary.length ? Math.floor(Math.random() * subPrimary.length) : 0
         for (let k = 0; k < subPrimary.length && attempts < MAX_TOTAL_GROUP_ATTEMPTS; k++) {
@@ -276,9 +310,21 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       }
 
       if (lastErr) {
+        // —— fallback_failure 告警：primary 全败且 backup 也未能成功 ——
         const finalErr = lastErr as Response
         const detail = await finalErr.text().catch(() => '')
         const status = finalErr.status || 502
+        if (backupGroups.length > 0) {
+          safeWaitUntil(c, sendAlert(c.env, 'fallback_failure', `group:${modelId}`,
+            `🚨 <b>自动切换失败</b>：${modelId}`,
+            `原始请求 ${isImageReq ? '（含图片）' : '（文本）'} 已从主力降级到备用组，但备用组也未返回成功\n路径：${modelId} → ${backupGroups.join(', ')}\n备用组尝试成员失败，最终错误：HTTP ${status} ${detail.substring(0, 200)}`
+          ))
+        } else {
+          safeWaitUntil(c, sendAlert(c.env, 'tier_degrade', `group:${modelId}`,
+            `⚠️ <b>梯队已无可用成员</b>：${modelId}`,
+            `主力组 ${primaryMembers.length} 个成员全部不可用（降权/禁用），且该组未配置 backup 组\n请检查 provider 状态`
+          ))
+        }
         return c.json({
           error: {
             message: `模型组 "${modelId}" 内所有可重试模型均失败`,
@@ -293,9 +339,6 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     }
 
     const directProvider = await getProvider(c.env, providerId)
-    if (directProvider?.status === 'pending') {
-      return c.json({ error: { message: `提供商 "${directProvider.name}" 尚未完成验证（状态: pending）`, type: 'provider_pending', request_id: requestId } }, 403)
-    }
     if (directProvider?.status === 'disabled') {
       return c.json({ error: { message: `提供商 "${directProvider.name}" 已禁用`, type: 'provider_disabled', request_id: requestId } }, 403)
     }
@@ -311,6 +354,10 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     // 未识别的异常（KV 故障、程序 bug 等）不是客户端输入的问题，不应该报 400。
     const error = err as Error
     console.error('[proxy] handleProxy 未预期的内部异常:', error)
+    safeWaitUntil(c, sendAlert(c.env, 'gateway_5xx', 'handleProxy',
+      `🔴 <b>网关内部异常</b>`,
+      `位置：handleProxy\n错误：${error.message || error}`
+    ))
     return c.json({ error: { message: '代理转发内部错误', type: 'internal_error', request_id: requestId } }, 500)
   }
 }
@@ -320,7 +367,7 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
   try {
     const provider = await getProvider(c.env, providerId)
     if (!provider) return c.json({ error: { message: `提供商 "${providerId}" 不存在`, type: 'invalid_request_error', request_id: requestId } }, 404)
-    if (provider.status !== 'active') return c.json({ error: { message: `提供商 "${provider.name}" 状态为 ${provider.status}`, type: 'provider_inactive', request_id: requestId } }, 403)
+    if (provider.status === 'disabled') return c.json({ error: { message: `提供商 "${provider.name}" 已禁用`, type: 'provider_disabled', request_id: requestId } }, 403)
     if (!provider.enabled) return c.json({ error: { message: `提供商 "${provider.name}" 已禁用`, type: 'provider_disabled', request_id: requestId } }, 403)
 
     const modelConfig = provider.models.find(m => m.id === modelId)
@@ -334,6 +381,7 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
     const timeoutMs = getRequestTimeoutMs(c.env)
 
     if (isOpenCodeProvider(providerId)) {
+      const attemptStarted = Date.now()
       const response = await proxyOpenCodeRequest({
         baseUrl: provider.baseUrl,
         apiKeys: enabledKeys,
@@ -344,15 +392,59 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
         mirrorUrls: resolveOpenCodeUrls(c.env),
         timeoutMs,
       })
+      const latencyMs = Date.now() - attemptStarted
+      const keyMasked = maskKey(enabledKeys[0]?.key || '')
+      const opencodeKey = enabledKeys[0]?.key || 'public'
+
+      // 在返回前 clone response，供 telemetry 解析使用
+      const telemetryClone = response.clone()
+
       const headers = copySafeResponseHeaders(response.headers)
       headers.set('X-Request-ID', requestId)
-      return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+      const clientResponse = new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+
+      // 非阻塞：记录 telemetry 和健康度
+      safeWaitUntil(c, (async () => {
+        // 记录请求事件
+        await recordRequestEvent(c.env, {
+          ts: Date.now(), providerId, modelId, keyMasked,
+          status: response.status, latencyMs, requestId,
+          outcome: response.status < 500 ? 'success' : 'retry',
+          routeKey,
+        })
+        await updateLastActive(c.env, providerId, { providerId, modelId, keyMasked, ts: Date.now() })
+        await updateLastActive(c.env, routeKey, { providerId, modelId, keyMasked, ts: Date.now() })
+
+        // 尝试解析 usage（非流式响应）
+        if (response.status < 500) {
+          try {
+            const json: any = await telemetryClone.json()
+            const usage = json?.usage
+            if (usage) {
+              await recordUsage(c.env, providerId, usage.input_tokens ?? usage.prompt_tokens ?? 0, usage.output_tokens ?? usage.completion_tokens ?? 0)
+            }
+          } catch { /* not JSON, skip usage */ }
+        }
+
+        // 健康度记录：424（镜像全部失败）或 5xx 记录失败
+        if (response.status === 424 || response.status >= 500) {
+          const healthData = await readHealth(c.env, providerId)
+          const h = healthData[opencodeKey] || { failures: 0, lastFailed: false }
+          h.failures = (h.failures || 0) + 1
+          if (h.failures >= KEY_HEALTH_MAX_FAILURES) h.demotedAt = Date.now()
+          h.lastFailed = true
+          healthData[opencodeKey] = h
+          await writeHealth(c.env, providerId, healthData)
+        }
+      })())
+
+      return clientResponse
     }
 
     if (enabledKeys.length === 0) return c.json({ error: { message: `提供商 "${provider.name}" 未配置可用的 API Key`, type: 'configuration_error', request_id: requestId } }, 500)
 
     const cleanBase = provider.baseUrl.replace(/\/+$/, '')
-    const apiBase = /\/v1$/i.test(cleanBase) ? cleanBase : `${cleanBase}/v1`
+    const apiBase = /\/v\d+$/i.test(cleanBase) ? cleanBase : `${cleanBase}/v1`
     const forwardUrl = `${apiBase}/${subPath}${url.search}`
     const healthData = await readHealth(c.env, providerId)
     const now = Date.now()
@@ -384,6 +476,11 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
     // 只有所有正常/试用 key 都不可用时才强制尝试冷却中的 key，避免主动撞限流/坏 key。
     if (keyOrder.length === 0) keyOrder.push(...demoted)
     if (demoted.length > 0) console.log(`[proxy] ${providerId}: ${demoted.length} key(s) cooling/downranked`)
+    // 降权/冷却中的 key 大概率还是会失败，没必要等满全额超时才失败转移到下一个候选——
+    // 缩短它的超时能让"发现这个 provider 已经不行了 → 尝试下一个梯队成员/保底链"这个
+    // 过程明显加快，只影响降权 key 的等待时间，不影响健康 key 的正常超时预算。
+    const demotedSet = new Set(demoted)
+    const demotedTimeoutMs = Math.max(Math.floor(timeoutMs / 4), 15_000)
 
     let lastError: Response | null = null
     let healthUpdated = false
@@ -393,19 +490,35 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
       const apiKey = enabledKeys[keyIndex].key
       const keyMasked = maskKey(apiKey)
       const attemptStarted = Date.now()
+      const effectiveTimeoutMs = demotedSet.has(keyIndex) ? demotedTimeoutMs : timeoutMs
       try {
         const forwardHeaders = buildForwardHeaders(c, provider.apiType, apiKey)
         const response = await fetch(forwardUrl, {
           method: c.req.method,
           headers: forwardHeaders,
           body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(forwardBody),
-          signal: AbortSignal.timeout(timeoutMs),
+          signal: AbortSignal.timeout(effectiveTimeoutMs),
         })
 
         if (response.ok) {
           if (healthData[apiKey]?.failures > 0 || healthData[apiKey]?.cooldownUntil) {
             delete healthData[apiKey]
             healthUpdated = true
+          }
+          // —— 多模态"假成功"检测：200 但模型未识别图片 / reasoning token 预算不足 ——
+          if (!isStreamRequest && hasImageContent(forwardBody)) {
+            safeWaitUntil(c, (async () => {
+              try {
+                const bodyText = await response.clone().text()
+                const issue = detectMultimodalFailure(200, bodyText)
+                if (issue) {
+                  await sendAlert(c.env, 'multimodal_failure', `${providerId}:${modelId}`,
+                    `🖼️ <b>多模态异常</b>：${providerId}/${modelId}`,
+                    `${issue}\n请求模型：${providerId}/${modelId}`
+                  )
+                }
+              } catch { /* 读取失败忽略 */ }
+            })())
           }
           const headers = copySafeResponseHeaders(response.headers)
           headers.set('X-Request-ID', requestId)
@@ -448,7 +561,15 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
         if (response.status === 429) {
           const retryAfter = parseRetryAfter(response.headers.get('Retry-After'))
           const h = healthData[apiKey] || { failures: 0, lastFailed: false }
-          if (retryAfter > 0) h.cooldownUntil = Date.now() + retryAfter
+          if (retryAfter > 0) {
+            // 有 Retry-After：按上游给的精确时间冷却
+            h.cooldownUntil = Date.now() + retryAfter
+          } else {
+            // 无头：走原来的失败计数逻辑，累加 failures，达标后降权
+            h.failures++
+            if (h.failures >= KEY_HEALTH_MAX_FAILURES) h.demotedAt = Date.now()
+          }
+          h.lastFailed = true
           healthData[apiKey] = h
           healthUpdated = true
           lastError = response
@@ -480,6 +601,16 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
         const result = (() => {
           try { return JSON.parse(errorBody) } catch { return { error: { message: errorBody || `HTTP ${response.status}` } } }
         })()
+        // —— 多模态 400 错误检测 ——
+        if (hasImageContent(forwardBody)) {
+          const multimodalIssue = detectMultimodalFailure(response.status, errorBody)
+          if (multimodalIssue) {
+            safeWaitUntil(c, sendAlert(c.env, 'multimodal_failure', `${providerId}:${modelId}`,
+              `🖼️ <b>多模态异常</b>：${providerId}/${modelId}`,
+              `${multimodalIssue}\n请求模型：${providerId}/${modelId}\nHTTP ${response.status}`
+            ))
+          }
+        }
         safeWaitUntil(c, recordRequestEvent(c.env, {
           ts: Date.now(), providerId, modelId, keyMasked,
           status: response.status, latencyMs: Date.now() - attemptStarted, requestId,

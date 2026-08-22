@@ -5,7 +5,7 @@ import type { Env, ModelGroup, Provider, ProxyKey, Session, ProviderStatus } fro
 // ===== 提供商 CRUD =====
 
 export async function getProviders(env: Env): Promise<Provider[]> {
-  const data = await env.KV.get(KV_KEYS.PROVIDERS)
+  const data = await env.KV.get(KV_KEYS.PROVIDERS, { cacheTtl: 60 })
   return data ? JSON.parse(data) : []
 }
 
@@ -75,7 +75,8 @@ export async function setProviderStatus(
 
 export async function getActiveProviders(env: Env): Promise<Provider[]> {
   const providers = await getProviders(env)
-  return providers.filter((p) => p.enabled && p.status !== 'pending' && p.status !== 'disabled')
+  // active 与 pending 均可参与路由（pending 仅标记，配了有效 key 即可用），只排除 disabled
+  return providers.filter((p) => p.enabled && p.status !== 'disabled')
 }
 
 export async function testProviderStatus(
@@ -96,41 +97,63 @@ export async function testProviderStatus(
 
   try {
     const cleanBase = provider.baseUrl.replace(/\/+$/, '')
-    const v1Base = /\/v1$/i.test(cleanBase) ? cleanBase : `${cleanBase}/v1`
-    let response: Response
+    const v1Base = /\/v\d+$/i.test(cleanBase) ? cleanBase : `${cleanBase}/v1`
+    const endpoint = testEndpoint === 'models' ? 'models' : (provider.apiType === 'anthropic' ? 'messages' : 'chat/completions')
 
-    if (testEndpoint === 'models') {
-      response = await fetch(`${v1Base}/models`, {
-        method: 'GET',
-        headers: provider.apiType === 'anthropic'
-          ? { 'x-api-key': enabledKeys[0].key, 'anthropic-version': '2023-06-01' }
-          : { 'Authorization': `Bearer ${enabledKeys[0].key}` },
-        signal: AbortSignal.timeout(10000),
-      })
-    } else {
-      const endpoint = provider.apiType === 'anthropic' ? 'messages' : 'chat/completions'
-      response = await fetch(`${v1Base}/${endpoint}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(provider.apiType === 'anthropic'
-            ? { 'x-api-key': enabledKeys[0].key, 'anthropic-version': '2023-06-01' }
-            : { 'Authorization': `Bearer ${enabledKeys[0].key}` }),
-        },
-        body: JSON.stringify({
-          model: provider.models[0]?.id || 'test',
-          messages: [{ role: 'user', content: 'hi' }],
-          max_tokens: 1,
-        }),
-        signal: AbortSignal.timeout(10000),
-      })
+    let okCount = 0
+    const failures: string[] = []
+
+    // 遍历所有 enabled key，逐 key 探测；任一 key 可用即视为 provider 整体 active。
+    // 多 key provider（llmhost 5 key / sensenova 2 key）若只测第一个 key，其余 key 失效
+    // 会被面板掩盖——这是 TD-02 修复：全 key 探测，面板能反映"几/n key 有效"。
+    for (const k of enabledKeys) {
+      let response: Response
+      try {
+        if (testEndpoint === 'models') {
+          response = await fetch(`${v1Base}/models`, {
+            method: 'GET',
+            headers: provider.apiType === 'anthropic'
+              ? { 'x-api-key': k.key, 'anthropic-version': '2023-06-01' }
+              : { 'Authorization': `Bearer ${k.key}` },
+            signal: AbortSignal.timeout(10000),
+          })
+        } else {
+          response = await fetch(`${v1Base}/${endpoint}`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(provider.apiType === 'anthropic'
+                ? { 'x-api-key': k.key, 'anthropic-version': '2023-06-01' }
+                : { 'Authorization': `Bearer ${k.key}` }),
+            },
+            body: JSON.stringify({
+              model: provider.models[0]?.id || 'test',
+              messages: [{ role: 'user', content: 'hi' }],
+              max_tokens: 1,
+            }),
+            signal: AbortSignal.timeout(10000),
+          })
+        }
+
+        if (response.ok) {
+          okCount++
+        } else {
+          const errorText = await response.text().catch(() => '')
+          failures.push(`key #${enabledKeys.indexOf(k) + 1}: HTTP ${response.status} ${errorText.slice(0, 120)}`)
+        }
+      } catch (err) {
+        failures.push(`key #${enabledKeys.indexOf(k) + 1}: ${err instanceof Error ? err.message : String(err)}`)
+      }
     }
 
-    if (response.ok) {
-      return { success: true, reason: '' }
+    if (okCount > 0) {
+      // 任一 key 可用 → active；附上"x/y key 有效"信息（部分 key 失效时提示，非错误）
+      const partial = okCount < enabledKeys.length
+        ? `${okCount}/${enabledKeys.length} key 有效，${enabledKeys.length - okCount} 个失效`
+        : `${enabledKeys.length}/${enabledKeys.length} key 有效`
+      return { success: true, reason: partial }
     } else {
-      const errorText = await response.text().catch(() => '')
-      return { success: false, reason: `HTTP ${response.status}: ${errorText.slice(0, 200)}` }
+      return { success: false, reason: `全部 ${enabledKeys.length} 个 key 均失败。${failures.join(' | ')}` }
     }
   } catch (err) {
     return { success: false, reason: `Error: ${err instanceof Error ? err.message : String(err)}` }
@@ -215,7 +238,7 @@ export async function validateProxyKey(env: Env, key: string): Promise<boolean> 
 
 // ===== 初始数据填充 =====
 
-import { DEFAULT_PROVIDERS, PROXY_KEY_PREFIX } from './config'
+import { DEFAULT_PROVIDERS, DEFAULT_MODEL_GROUPS, PROXY_KEY_PREFIX } from './config'
 
 export async function seedInitialData(env: Env): Promise<void> {
   const providers = await getProviders(env)
@@ -250,12 +273,20 @@ export async function seedInitialData(env: Env): Promise<void> {
       await addProxyKey(env, testKey)
     }
   }
+
+  // 首次运行时创建默认三类型模型组（仅在无任何分组时）
+  const groupIds = await getModelGroupIds(env)
+  if (groupIds.length === 0) {
+    for (const g of DEFAULT_MODEL_GROUPS) {
+      await saveModelGroup(env, { ...g, members: [...g.members] })
+    }
+  }
 }
 
 // ===== 模型组 CRUD =====
 
 export async function getModelGroup(env: Env, groupId: string): Promise<ModelGroup | null> {
-  const raw = await env.KV.get(MODEL_GROUP_KEY(groupId))
+  const raw = await env.KV.get(MODEL_GROUP_KEY(groupId), { cacheTtl: 60 })
   return raw ? JSON.parse(raw) : null
 }
 
