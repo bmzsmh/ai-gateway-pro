@@ -489,34 +489,14 @@ ${H('管理')}
 
       <section id="monitoring" class="workspace-section" aria-labelledby="monitoring-title">
         <div class="section-heading section-heading--admin">
-          <div><h2 id="monitoring-title">监控</h2><p>最近请求日志、当前活跃模型与每日消耗用量。</p></div>
-          <button class="btn btn-s" onclick="refreshMonitoring()"><i class="fas fa-sync-alt" aria-hidden="true"></i>刷新</button>
-        </div>
-
-        <div class="mon-grid" id="mon-active-grid" aria-label="当前活跃模型">
-          <div class="mon-active-card"><h4>第一梯队（主力）</h4><div class="mon-active-body mon-active-empty" id="mon-active-primary">加载中…</div></div>
-          <div class="mon-active-card"><h4>第二梯队（备用）</h4><div class="mon-active-body mon-active-empty" id="mon-active-backup">加载中…</div></div>
-          <div class="mon-active-card"><h4>多模态</h4><div class="mon-active-body mon-active-empty" id="mon-active-multimodal">加载中…</div></div>
-        </div>
-
-        <div class="mon-controls">
-          <label for="mon-provider-select" class="fg" style="margin:0;"><span style="font-size:.8125rem;color:var(--color-muted);">查看提供商</span></label>
-          <select id="mon-provider-select" onchange="refreshMonitoring()">
-            ${providers.length ? providers.map(p => `<option value="${escapePageHtml(p.id)}">${escapePageHtml(p.name)} (${escapePageHtml(p.id)})</option>`).join('') : '<option value="">暂无提供商</option>'}
-          </select>
-        </div>
-
-        <div class="mon-active-card" style="margin-bottom:var(--space-md);">
-          <h4>今日用量</h4>
-          <div id="mon-usage-body">
-            <p class="mon-active-empty" id="mon-usage-empty">加载中…</p>
-          </div>
+          <div><h2 id="monitoring-title">监控</h2><p>网关告警历史（TG 通知记录）。</p></div>
+          <button class="btn btn-s" onclick="loadAlertHistory()"><i class="fas fa-sync-alt" aria-hidden="true"></i>刷新</button>
         </div>
 
         <div class="mon-active-card">
-          <h4>最近请求日志（最多 80 条，最新在前）</h4>
-          <div id="mon-log-body">
-            <div class="mon-log-empty" id="mon-log-loading">加载中…</div>
+          <h4>告警历史（最多 200 条，最新在前）</h4>
+          <div id="mon-alert-body">
+            <div class="mon-log-empty" id="mon-alert-loading">加载中…</div>
           </div>
         </div>
       </section>
@@ -529,8 +509,6 @@ ${H('管理')}
 <div id="modal" class="modal-o hd" role="presentation" onclick="if(event.target===this)closeM()"><div class="modal" id="mc" role="dialog" aria-modal="true" aria-live="polite"></div></div>
 
 <script>${SHARED_JS}
-// 内嵌模型组数据：监控页按 type 动态渲染活跃状态卡片（primary/backup/multimodal）
-const EMBED_MODEL_GROUPS = ${JSON.stringify(modelGroups.map(g => ({ id: g.id, type: g.type || (g.multimodal ? 'multimodal' : 'primary'), enabled: g.enabled !== false })))};
 // copy
 function copyText(t, el) {
   const i = el.tagName === 'I' ? el : (el.querySelector('i') || el.parentElement?.querySelector('i'))
@@ -1178,68 +1156,30 @@ adminNavLinks.forEach(function (link) {
 window.addEventListener('hashchange', function () { setActiveAdminNav(location.hash) })
 setActiveAdminNav(location.hash)
 
-// ===== 监控面板 =====
-function monStatusClass(status) {
-  if (status === 429) return 'mon-status-429'
-  if (status >= 500) return 'mon-status-5xx'
-  if (status >= 400) return 'mon-status-4xx'
-  return 'mon-status-2xx'
+// ===== 监控面板（2026-08-24 决策：删遥测，仅显示告警历史） =====
+const ALERT_TYPE_LABELS = {
+  kv_quota: 'KV 配额预警',
+  tier_degrade: '梯队降级',
+  fallback_failure: '自动切换失败',
+  multimodal_failure: '多模态异常',
+  gateway_5xx: '网关内部异常',
 }
-function monFmtTime(ts) {
-  const d = new Date(ts)
-  return d.toLocaleTimeString('zh-CN', { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0')
+function alertTypeLabel(type) {
+  return ALERT_TYPE_LABELS[type] || type
 }
-function monFmtAgo(ts) {
-  const diff = Math.max(0, Date.now() - ts)
-  if (diff < 60000) return Math.floor(diff / 1000) + ' 秒前'
-  if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前'
-  return Math.floor(diff / 3600000) + ' 小时前'
-}
-async function loadLastActive(scope, elId) {
-  const el = document.getElementById(elId)
-  if (!el) return
-  try {
-    const r = await fetch('/admin/api/telemetry/last-active?scope=' + encodeURIComponent(scope))
-    const d = await r.json()
-    if (d.success && d.data) {
-      el.classList.remove('mon-active-empty')
-      el.innerHTML = escapeHtml(d.data.providerId) + ' / ' + escapeHtml(d.data.modelId) + '<br>' + escapeHtml(d.data.keyMasked) + ' · ' + monFmtAgo(d.data.ts)
-    } else {
-      el.classList.add('mon-active-empty')
-      el.textContent = '暂无记录'
-    }
-  } catch (e) {
-    el.classList.add('mon-active-empty')
-    el.textContent = '加载失败'
-  }
-}
-async function loadUsage(providerId) {
-  const body = document.getElementById('mon-usage-body')
+async function loadAlertHistory() {
+  const body = document.getElementById('mon-alert-body')
   if (!body) return
-  if (!providerId) { body.innerHTML = '<p class="mon-active-empty">请先选择提供商</p>'; return }
   try {
-    const r = await fetch('/admin/api/telemetry/usage/' + encodeURIComponent(providerId))
+    const r = await fetch('/admin/api/alerts')
     const d = await r.json()
-    const usage = (d.success && d.data) ? d.data : { tokensIn: 0, tokensOut: 0, requests: 0 }
-    const totalTokens = (usage.tokensIn || 0) + (usage.tokensOut || 0)
-    body.innerHTML = '<p style="font-size:.8125rem;color:var(--color-muted);margin:0;">今日请求 <strong style="color:var(--color-ink);">' + usage.requests + '</strong> 次 · Token 输入 <strong style="color:var(--color-ink);">' + (usage.tokensIn||0) + '</strong> · 输出 <strong style="color:var(--color-ink);">' + (usage.tokensOut||0) + '</strong>（合计 ' + totalTokens + '）</p><p style="font-size:.75rem;color:var(--color-muted);margin-top:.25rem;">仅统计展示，不做用量限制；流式请求的 token 数暂无法解析，按 0 计。</p>'
-  } catch (e) {
-    body.innerHTML = '<p class="mon-active-empty">加载失败</p>'
-  }
-}
-async function loadLog(providerId) {
-  const body = document.getElementById('mon-log-body')
-  if (!body) return
-  if (!providerId) { body.innerHTML = '<div class="mon-log-empty">请先选择提供商</div>'; return }
-  try {
-    const r = await fetch('/admin/api/telemetry/log/' + encodeURIComponent(providerId))
-    const d = await r.json()
-    const log = (d.success && Array.isArray(d.data)) ? d.data.slice().reverse() : []
-    if (log.length === 0) { body.innerHTML = '<div class="mon-log-empty">暂无请求记录</div>'; return }
-    let html = '<table class="mon-log-table"><thead><tr><th>时间</th><th>状态</th><th>模型</th><th>Key</th><th>耗时</th><th>结果</th></tr></thead><tbody>'
-    log.forEach(function (ev) {
-      const outcomeText = ev.outcome === 'success' ? '成功' : (ev.outcome === 'retry' ? '重试' : '失败')
-      html += '<tr><td>' + monFmtTime(ev.ts) + '</td><td><span class="mon-status-chip ' + monStatusClass(ev.status) + '">' + ev.status + '</span></td><td>' + escapeHtml(ev.modelId) + '</td><td>' + escapeHtml(ev.keyMasked) + '</td><td>' + ev.latencyMs + 'ms</td><td>' + outcomeText + '</td></tr>'
+    const list = (d.success && Array.isArray(d.data)) ? d.data : []
+    if (list.length === 0) { body.innerHTML = '<div class="mon-log-empty">暂无告警记录</div>'; return }
+    let html = '<table class="mon-log-table"><thead><tr><th>时间</th><th>类型</th><th>标题</th><th>详情</th></tr></thead><tbody>'
+    list.forEach(function (a) {
+      const t = new Date(a.ts)
+      const timeStr = t.toLocaleDateString('zh-CN') + ' ' + t.toLocaleTimeString('zh-CN', { hour12: false })
+      html += '<tr><td style="white-space:nowrap;">' + timeStr + '</td><td><span class="mon-status-chip">' + escapeHtml(alertTypeLabel(a.type)) + '</span></td><td>' + escapeHtml(a.title || '') + '</td><td style="white-space:pre-wrap;max-width:480px;">' + escapeHtml(a.detail || '') + '</td></tr>'
     })
     html += '</tbody></table>'
     body.innerHTML = html
@@ -1247,36 +1187,8 @@ async function loadLog(providerId) {
     body.innerHTML = '<div class="mon-log-empty">加载失败</div>'
   }
 }
-function refreshMonitoring() {
-  // 按类型渲染活跃状态卡片
-  const types = [
-    { type: 'primary', el: 'mon-active-primary', label: '第一梯队（主力）' },
-    { type: 'backup', el: 'mon-active-backup', label: '第二梯队（备用）' },
-    { type: 'multimodal', el: 'mon-active-multimodal', label: '多模态' }
-  ]
-  types.forEach(function (t) {
-    const groups = (EMBED_MODEL_GROUPS || []).filter(g => g.type === t.type && g.enabled)
-    const el = document.getElementById(t.el)
-    if (!el) return
-    if (groups.length === 0) {
-      el.classList.add('mon-active-empty')
-      el.textContent = '暂无 ' + t.label + ' 分组'
-      return
-    }
-    // 该类型下多个分组：逐个查询，都显示
-    el.classList.remove('mon-active-empty')
-    el.innerHTML = groups.map(g => '<div class="mon-group-row"><strong>' + escapeHtml(g.id) + '</strong><span class="mon-group-last" id="mla-' + t.el + '-' + escapeHtml(g.id) + '">…</span></div>').join('')
-    groups.forEach(function (g) {
-      loadLastActive('group/' + encodeURIComponent(g.id), 'mla-' + t.el + '-' + g.id)
-    })
-  })
-  const sel = document.getElementById('mon-provider-select')
-  const providerId = sel ? sel.value : ''
-  loadUsage(providerId)
-  loadLog(providerId)
-}
 if (document.getElementById('monitoring')) {
-  refreshMonitoring()
+  loadAlertHistory()
 }
 </script>
 </body></html>`)

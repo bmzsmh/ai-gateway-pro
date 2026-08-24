@@ -1,5 +1,6 @@
 import { KV_KEYS } from './config'
 import { MODEL_GROUP_KEY } from './config'
+import { countKvWrite } from './alerts'
 import type { Env, ModelGroup, Provider, ProxyKey, Session, ProviderStatus } from './types'
 
 // ===== 提供商 CRUD =====
@@ -16,6 +17,7 @@ export async function getProvider(env: Env, id: string): Promise<Provider | null
 
 export async function setProviders(env: Env, providers: Provider[]): Promise<void> {
   await env.KV.put(KV_KEYS.PROVIDERS, JSON.stringify(providers))
+  await countKvWrite(env)
 }
 
 export async function addProvider(env: Env, provider: Provider): Promise<void> {
@@ -171,6 +173,7 @@ export async function createSession(env: Env, username: string, ttlSeconds: numb
   await env.KV.put(KV_KEYS.SESSION_PREFIX + sessionId, JSON.stringify(session), {
     expirationTtl: ttlSeconds,
   })
+  await countKvWrite(env)
   return sessionId
 }
 
@@ -187,6 +190,7 @@ export async function getSession(env: Env, sessionId: string): Promise<Session |
 
 export async function deleteSession(env: Env, sessionId: string): Promise<void> {
   await env.KV.delete(KV_KEYS.SESSION_PREFIX + sessionId)
+  await countKvWrite(env)
 }
 
 // ===== 转发 Key =====
@@ -198,12 +202,14 @@ export async function getProxyKeys(env: Env): Promise<ProxyKey[]> {
 
 export async function setProxyKeys(env: Env, keys: ProxyKey[]): Promise<void> {
   await env.KV.put(KV_KEYS.PROXY_KEYS, JSON.stringify(keys))
+  await countKvWrite(env)
 }
 
 export async function addProxyKey(env: Env, key: ProxyKey): Promise<void> {
   const keys = await getProxyKeys(env)
   keys.push(key)
   await setProxyKeys(env, keys)
+  await countKvWrite(env)
 }
 
 export async function deleteProxyKey(env: Env, id: string): Promise<boolean> {
@@ -211,6 +217,7 @@ export async function deleteProxyKey(env: Env, id: string): Promise<boolean> {
   const filtered = keys.filter((k) => k.id !== id)
   if (filtered.length === keys.length) return false
   await setProxyKeys(env, filtered)
+  await countKvWrite(env)
   return true
 }
 
@@ -220,6 +227,7 @@ export async function updateProxyKey(env: Env, id: string, updates: Partial<Prox
   if (idx === -1) return null
   keys[idx] = { ...keys[idx], ...updates }
   await setProxyKeys(env, keys)
+  await countKvWrite(env)
   return keys[idx]
 }
 
@@ -297,17 +305,21 @@ export async function getModelGroupIds(env: Env): Promise<string[]> {
 
 export async function saveModelGroup(env: Env, group: ModelGroup): Promise<void> {
   await env.KV.put(MODEL_GROUP_KEY(group.id), JSON.stringify(group))
+  await countKvWrite(env)
   const ids = await getModelGroupIds(env)
   if (!ids.includes(group.id)) {
     ids.push(group.id)
     await env.KV.put(KV_KEYS.MODEL_GROUP_LIST, JSON.stringify(ids))
+    await countKvWrite(env)
   }
 }
 
 export async function deleteModelGroup(env: Env, groupId: string): Promise<void> {
   await env.KV.delete(MODEL_GROUP_KEY(groupId))
+  await countKvWrite(env)
   const ids = await getModelGroupIds(env)
   await env.KV.put(KV_KEYS.MODEL_GROUP_LIST, JSON.stringify(ids.filter((id) => id !== groupId)))
+  await countKvWrite(env)
 }
 
 export async function getModelGroups(env: Env): Promise<ModelGroup[]> {

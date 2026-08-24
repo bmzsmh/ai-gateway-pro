@@ -19,7 +19,6 @@ import {
 import { testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL, SAFE_RESOURCE_ID_RE, SAFE_MODEL_ID_RE } from './config'
-import { getRequestLog, getLastActive, getUsage } from './telemetry'
 import { getAlertHistory } from './alerts'
 import type {
   Env,
@@ -181,40 +180,6 @@ export async function handleStatus(c: Context<{ Bindings: Env }>) {
       baseUrl: new URL(c.req.url).origin,
     },
   })
-}
-
-// ===== 遥测查询（第1层：先只提供只读接口验证数据，UI 面板留待第2层） =====
-
-export async function handleGetTelemetryLog(c: Context<{ Bindings: Env }>) {
-  const providerId = c.req.param('providerId')
-  if (!validResourceId(providerId)) {
-    return c.json<ApiResponse>({ success: false, message: 'providerId 格式非法' }, 400)
-  }
-  const log = await getRequestLog(c.env, providerId)
-  return c.json<ApiResponse>({ success: true, data: log })
-}
-
-export async function handleGetLastActive(c: Context<{ Bindings: Env }>) {
-  // scope 可能是 "group/auto-task" 这类带斜杠的 routeKey，用 query 参数而非路径参数以避免路由分段问题。
-  const scope = c.req.query('scope')
-  if (typeof scope !== 'string' || scope.length === 0 || scope.length > 200) {
-    return c.json<ApiResponse>({ success: false, message: 'scope 参数非法（请用 ?scope= 查询参数）' }, 400)
-  }
-  const info = await getLastActive(c.env, scope)
-  return c.json<ApiResponse>({ success: true, data: info })
-}
-
-export async function handleGetUsage(c: Context<{ Bindings: Env }>) {
-  const providerId = c.req.param('providerId')
-  if (!validResourceId(providerId)) {
-    return c.json<ApiResponse>({ success: false, message: 'providerId 格式非法' }, 400)
-  }
-  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return c.json<ApiResponse>({ success: false, message: 'date 参数格式应为 YYYY-MM-DD' }, 400)
-  }
-  const usage = await getUsage(c.env, providerId, date)
-  return c.json<ApiResponse>({ success: true, data: usage })
 }
 
 export async function handleGetAlertHistory(c: Context<{ Bindings: Env }>) {

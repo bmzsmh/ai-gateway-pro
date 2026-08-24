@@ -32,15 +32,9 @@ export const MAX_TOTAL_GROUP_ATTEMPTS = 6
 export const SAFE_RESOURCE_ID_RE = /^[A-Za-z0-9_-]+$/
 export const SAFE_MODEL_ID_RE = /^[A-Za-z0-9._:/-]+$/
 
-// 请求体 model 字段的最大长度（"提供商ID/模型ID" 整体）。防止构造超长字符串
-// 污染遥测 KV key、或在未来代码里被拼接使用时放大风险。管理端创建 provider/model
-// 时已按各自字段做过校验，这里是运行时入口的兜底。
+// 请求体 model 字段的最大长度（ProviderId/MODELID 整体）。防止构造超长字符串
+// 被不当使用。管理端创建 provider/model 时已按各自字段做过校验。
 export const MAX_MODEL_STRING_LENGTH = 300
-
-// 遥测：环形请求日志每个 provider 最多保留的条数
-export const TELEMETRY_LOG_MAX_ENTRIES = 80
-// 遥测：用量聚合记录的 KV TTL（约35天，避免历史数据无限堆积）
-export const TELEMETRY_USAGE_TTL_SECONDS = 35 * 24 * 60 * 60
 
 export const KV_KEYS = {
   PROVIDERS: 'providers',
@@ -49,9 +43,6 @@ export const KV_KEYS = {
   KEY_HEALTH_PREFIX: 'key:health:',
   OPENCODE_MIGRATION: 'migration:opencode-default:v1',
   MODEL_GROUP_LIST: 'model_group_list',
-  TELEMETRY_LOG_PREFIX: 'telemetry:log:',
-  TELEMETRY_ACTIVE_PREFIX: 'telemetry:active:',
-  TELEMETRY_USAGE_PREFIX: 'telemetry:usage:',
 } as const
 
 /** 模型组 KV key 前缀 */

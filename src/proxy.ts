@@ -13,7 +13,7 @@ import {
 } from './config'
 import type { Env, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
-import { recordRequestEvent, updateLastActive, recordUsage, maskKey, type RequestEvent } from './telemetry'
+import { maskKey } from './telemetry'
 import { sendAlert, countKvWrite, detectMultimodalFailure, hasImageContent, type AlertType } from './alerts'
 
 interface KeyHealth {
@@ -84,16 +84,21 @@ async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
 async function writeHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
   const filtered: HealthMap = {}
   for (const [k, v] of Object.entries(health)) {
-    if (v.failures > 0 || (v.cooldownUntil && v.cooldownUntil > Date.now())) filtered[k] = v
+    // P1-2026-08-24：只有达到降权阈值（failures>=5）或冷却中的 key 才写 KV。
+    // 1~4 次普通失败仅内存缓存（isolate 内 5s TTL），不落 KV —— 消除偶发失败的 KV 写入。
+    // 降权（demotedAt）与冷却（cooldownUntil）是路由必需状态，仍需持久化跨 isolate 生效。
+    if (v.failures >= KEY_HEALTH_MAX_FAILURES || (v.cooldownUntil && v.cooldownUntil > Date.now())) filtered[k] = v
   }
   // 先同步更新内存缓存，本 isolate 内后续请求立刻可见
   healthMemoryCache.set(providerId, { data: filtered, expiresAt: Date.now() + HEALTH_MEMORY_CACHE_TTL_MS })
-  // 同步写 KV（非 waitUntil 异步，避免 isolate 回收时更新丢失）
   if (Object.keys(filtered).length > 0) {
+    // 有降权/冷却 key → 写 KV（跨 isolate 共享降权状态）
     await env.KV.put(HEALTH_KEY(providerId), JSON.stringify(filtered))
     await countKvWrite(env)
   } else {
+    // 全部健康 → 清理 KV 残留（P2：delete 也计入 countKvWrite）
     await env.KV.delete(HEALTH_KEY(providerId)).catch(() => {})
+    await countKvWrite(env)
   }
 }
 
@@ -381,7 +386,6 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
     const timeoutMs = getRequestTimeoutMs(c.env)
 
     if (isOpenCodeProvider(providerId)) {
-      const attemptStarted = Date.now()
       const response = await proxyOpenCodeRequest({
         baseUrl: provider.baseUrl,
         apiKeys: enabledKeys,
@@ -392,40 +396,15 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
         mirrorUrls: resolveOpenCodeUrls(c.env),
         timeoutMs,
       })
-      const latencyMs = Date.now() - attemptStarted
       const keyMasked = maskKey(enabledKeys[0]?.key || '')
       const opencodeKey = enabledKeys[0]?.key || 'public'
-
-      // 在返回前 clone response，供 telemetry 解析使用
-      const telemetryClone = response.clone()
 
       const headers = copySafeResponseHeaders(response.headers)
       headers.set('X-Request-ID', requestId)
       const clientResponse = new Response(response.body, { status: response.status, statusText: response.statusText, headers })
 
-      // 非阻塞：记录 telemetry 和健康度
+      // 非阻塞：健康度降权记录（2026-08-24 决策：已删遥测，仅保留健康度）
       safeWaitUntil(c, (async () => {
-        // 记录请求事件
-        await recordRequestEvent(c.env, {
-          ts: Date.now(), providerId, modelId, keyMasked,
-          status: response.status, latencyMs, requestId,
-          outcome: response.status < 500 ? 'success' : 'retry',
-          routeKey,
-        })
-        await updateLastActive(c.env, providerId, { providerId, modelId, keyMasked, ts: Date.now() })
-        await updateLastActive(c.env, routeKey, { providerId, modelId, keyMasked, ts: Date.now() })
-
-        // 尝试解析 usage（非流式响应）
-        if (response.status < 500) {
-          try {
-            const json: any = await telemetryClone.json()
-            const usage = json?.usage
-            if (usage) {
-              await recordUsage(c.env, providerId, usage.input_tokens ?? usage.prompt_tokens ?? 0, usage.output_tokens ?? usage.completion_tokens ?? 0)
-            }
-          } catch { /* not JSON, skip usage */ }
-        }
-
         // 健康度记录：424（镜像全部失败）或 5xx 记录失败
         if (response.status === 424 || response.status >= 500) {
           const healthData = await readHealth(c.env, providerId)
@@ -524,37 +503,7 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
           headers.set('X-Request-ID', requestId)
           if (healthUpdated) await writeHealth(c.env, providerId, healthData)
 
-          // 非流式响应尝试解析 usage 字段做 token 统计；clone 出去读，不影响返回给客户端的 body。
-          const latencyMs = Date.now() - attemptStarted
-          const usageProbe = isStreamRequest ? Promise.resolve<{ tokensIn?: number; tokensOut?: number }>({}) : (async () => {
-            try {
-              const json: any = await response.clone().json()
-              const usage = json?.usage
-              if (!usage) return {}
-              return {
-                tokensIn: usage.input_tokens ?? usage.prompt_tokens,
-                tokensOut: usage.output_tokens ?? usage.completion_tokens,
-              }
-            } catch {
-              return {}
-            }
-          })()
-          safeWaitUntil(c, (async () => {
-            const { tokensIn, tokensOut } = await usageProbe
-            const event: RequestEvent = {
-              ts: Date.now(), providerId, modelId, keyMasked,
-              status: response.status, latencyMs, requestId, outcome: 'success',
-              routeKey, tokensIn, tokensOut,
-            }
-            await recordRequestEvent(c.env, event)
-            const activeInfo = { providerId, modelId, keyMasked, ts: event.ts }
-            await updateLastActive(c.env, providerId, activeInfo)
-            await updateLastActive(c.env, routeKey, activeInfo)
-            // 用量统计需要覆盖所有成功响应（含流式请求，token 数未知时按 0 记入 requests 计数）。
-            // 这里只做展示用的统计，不做任何限制或拦截。
-            await recordUsage(c.env, providerId, tokensIn || 0, tokensOut || 0)
-          })())
-
+          // 2026-08-24 决策：已删遥测（请求日志/活跃/用量）记录，正常请求不再产生 KV 写。
           return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
         }
 
@@ -573,11 +522,6 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
           healthData[apiKey] = h
           healthUpdated = true
           lastError = response
-          safeWaitUntil(c, recordRequestEvent(c.env, {
-            ts: Date.now(), providerId, modelId, keyMasked,
-            status: response.status, latencyMs: Date.now() - attemptStarted, requestId,
-            outcome: 'retry', routeKey,
-          }))
           continue
         }
 
@@ -589,11 +533,6 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
           healthData[apiKey] = h
           healthUpdated = true
           lastError = response
-          safeWaitUntil(c, recordRequestEvent(c.env, {
-            ts: Date.now(), providerId, modelId, keyMasked,
-            status: response.status, latencyMs: Date.now() - attemptStarted, requestId,
-            outcome: 'retry', routeKey,
-          }))
           continue
         }
 
@@ -611,11 +550,6 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
             ))
           }
         }
-        safeWaitUntil(c, recordRequestEvent(c.env, {
-          ts: Date.now(), providerId, modelId, keyMasked,
-          status: response.status, latencyMs: Date.now() - attemptStarted, requestId,
-          outcome: 'fail', routeKey,
-        }))
         return c.json(result, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
         const error = err as Error
@@ -626,11 +560,6 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
         healthData[apiKey] = h
         healthUpdated = true
         lastError = new Response(JSON.stringify({ error: { message: error.message || '请求失败', type: 'proxy_error' } }), { status: 502, headers: { 'Content-Type': 'application/json' } })
-        safeWaitUntil(c, recordRequestEvent(c.env, {
-          ts: Date.now(), providerId, modelId, keyMasked,
-          status: 502, latencyMs: Date.now() - attemptStarted, requestId,
-          outcome: 'retry', routeKey,
-        }))
         continue
       }
     }
@@ -639,11 +568,6 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
 
     if (lastError) {
       const errorBody = await lastError.text().catch(() => '所有 API Key 均失败')
-      safeWaitUntil(c, recordRequestEvent(c.env, {
-        ts: Date.now(), providerId, modelId, keyMasked: 'N/A',
-        status: lastError.status || 502, latencyMs: 0, requestId,
-        outcome: 'fail', routeKey,
-      }))
       const headers = new Headers({ 'Content-Type': 'application/json; charset=utf-8', 'X-Request-ID': requestId })
       return new Response(JSON.stringify({
         error: {

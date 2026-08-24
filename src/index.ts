@@ -23,9 +23,6 @@ import {
   handleDeleteModelGroup,
   handleTestProviderStatus,
   handleSetProviderStatus,
-  handleGetTelemetryLog,
-  handleGetLastActive,
-  handleGetUsage,
   handleGetAlertHistory,
 } from './admin'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
@@ -116,10 +113,6 @@ app.post('/admin/api/model-groups', handleCreateModelGroup)
 app.put('/admin/api/model-groups/:id', handleUpdateModelGroup)
 app.delete('/admin/api/model-groups/:id', handleDeleteModelGroup)
 
-// 遥测查询（第1层：只读接口，UI 面板留待第2层）
-app.get('/admin/api/telemetry/log/:providerId', handleGetTelemetryLog)
-app.get('/admin/api/telemetry/last-active', handleGetLastActive)
-app.get('/admin/api/telemetry/usage/:providerId', handleGetUsage)
 // 告警历史查询
 app.get('/admin/api/alerts', handleGetAlertHistory)
 app.get('/admin/api/alerts/:type', handleGetAlertHistory)

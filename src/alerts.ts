@@ -58,18 +58,21 @@ async function checkDebounce(env: Env, type: AlertType, scope: string): Promise<
         // 窗口期内：累计计数，不发送
         state.count++
         await env.KV.put(key, JSON.stringify(state))
+        await countKvWrite(env)
         return { ok: false, count: state.count }
       }
       // 窗口已过：如果之前有累计，发送汇总消息
       state.count++
       state.lastSent = now
       await env.KV.put(key, JSON.stringify(state))
+      await countKvWrite(env)
       return { ok: true, count: state.count }
     } catch { /* fall through */ }
   }
 
   // 首次触发
   await env.KV.put(key, JSON.stringify({ lastSent: now, count: 1 }))
+  await countKvWrite(env)
   return { ok: true, count: 1 }
 }
 
@@ -82,6 +85,7 @@ export async function recordAlert(env: Env, type: AlertType, detail: string, tit
     list.push({ ts: Date.now(), type, detail, title: title || '', iso: new Date().toISOString() })
     if (list.length > 200) list.splice(0, list.length - 200)
     await env.KV.put(key, JSON.stringify(list))
+    await countKvWrite(env)
   } catch (e) {
     console.warn('[alert] 记录告警失败:', e)
   }
