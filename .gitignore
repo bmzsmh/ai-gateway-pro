@@ -10,3 +10,21 @@ ADMIN_PASSWORD.txt
 # 生产/测试配置文件含KV ID等敏感标识，不入库，使用 example 模板
 wrangler.toml
 wrangler-test.toml
+
+# 凭据与备份敏感文件（公开仓库红线）
+.env
+.env.*
+*.key
+*.pem
+secrets/
+secret/
+credentials/
+kv_backup/
+kv_prod_backup_*/
+kv_test_backup_*/
+bak/
+*.bak
+*.bak.*
+MANIFEST.json
+*.ts.bak
+*.js.bak
