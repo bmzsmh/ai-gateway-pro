@@ -708,7 +708,7 @@ export async function handleUpdateModelGroup(c: Context<{ Bindings: Env }>) {
   if (!existing) {
     return c.json<ApiResponse>({ success: false, message: '模型组不存在' }, 404)
   }
-  const body = await c.req.json<Partial<ModelGroup>>()
+  const body = await c.req.json<Partial<ModelGroup> & { expectedMembers?: string[] }>()
   if (body.name !== undefined && (typeof body.name !== 'string' || body.name.length > MAX_PROVIDER_NAME_LENGTH)) {
     return c.json<ApiResponse>({ success: false, message: '模型组名称无效' }, 400)
   }
@@ -724,6 +724,21 @@ export async function handleUpdateModelGroup(c: Context<{ Bindings: Env }>) {
     }
     if (body.members.includes(`group/${existing.id}`)) {
       return c.json<ApiResponse>({ success: false, message: '模型组不能引用自身' }, 400)
+    }
+  }
+  // P0-2 冲突保护：保存前重新读取服务器最新 model_group，与客户端打开时的快照比较。
+  // 若服务器 members 已变化（如 cron 加入 group/xx），不允许 stale form 静默覆盖，返回 409。
+  if (body.members !== undefined && body.expectedMembers !== undefined) {
+    if (!Array.isArray(body.expectedMembers)) {
+      return c.json<ApiResponse>({ success: false, message: 'expectedMembers 必须是数组' }, 400)
+    }
+    const serverLatest = await getModelGroup(c.env, groupId)
+    const latestMembers = serverLatest ? [...new Set(serverLatest.members)] : []
+    const snapshot = [...new Set(body.expectedMembers)]
+    const sameLen = latestMembers.length === snapshot.length
+    const sameSet = sameLen && latestMembers.every(m => snapshot.includes(m)) && snapshot.every(m => latestMembers.includes(m))
+    if (!sameSet) {
+      return c.json<ApiResponse>({ success: false, code: 'CONFLICT', message: '模型组已被其他操作修改，请刷新后重新编辑' }, 409)
     }
   }
   const nextMembers = body.members !== undefined ? [...new Set(body.members)] : existing.members

@@ -49,6 +49,32 @@ function getRequestTimeoutMs(env: Env): number {
   return getPositiveInt(env.REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, 600_000)
 }
 
+// ===== P0-1 状态机辅助（2026-08-25 第二轮审查修复） =====
+// 语义：
+//   failures 累加无上限；demotedAt 只设置一次（降权起点）。
+//   失败发生在 cooldown 内（now - demotedAt < COOLDOWN）→ 不刷新 demotedAt（P0-1 原始目标：失败不持续延长同一个 cooldown）。
+//   失败发生在 probation 阶段（now - demotedAt >= COOLDOWN，即冷却已到期、key 正在被试用）→ 重置 demotedAt = now，
+//   启动一个新的完整 cooldown（第二轮审查补充：probation 失败后必须重新冷却，否则旧 demotedAt 过期会导致每个请求都立即再次 probation）。
+export function markKeyFailure(h: KeyHealth | undefined, now = Date.now()): KeyHealth {
+  const health = h && typeof h === 'object' ? { ...h } : { failures: 0, lastFailed: false }
+  health.failures = (health.failures || 0) + 1
+  health.lastFailed = true
+  if (health.failures >= KEY_HEALTH_MAX_FAILURES) {
+    if (!health.demotedAt || now - health.demotedAt >= KEY_HEALTH_COOLDOWN_MS) {
+      health.demotedAt = now
+    }
+  }
+  return health
+}
+
+/** 429 带 Retry-After：按上游指定精确时间冷却；无头则走失败计数（markKeyFailure）。 */
+function applyRateLimitHealth(h: KeyHealth | undefined, retryAfterMs: number | null, now = Date.now()): KeyHealth {
+  if (retryAfterMs !== null && retryAfterMs > 0) {
+    return { ...(h || { failures: 0, lastFailed: false }), failures: (h?.failures || 0) + 1, lastFailed: true, cooldownUntil: now + retryAfterMs }
+  }
+  return markKeyFailure(h, now)
+}
+
 function getMaxBodyBytes(env: Env): number {
   return getPositiveInt(env.MAX_REQUEST_BODY_BYTES, DEFAULT_MAX_REQUEST_BODY_BYTES, 20 * 1024 * 1024)
 }
@@ -408,11 +434,7 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
         // 健康度记录：424（镜像全部失败）或 5xx 记录失败
         if (response.status === 424 || response.status >= 500) {
           const healthData = await readHealth(c.env, providerId)
-          const h = healthData[opencodeKey] || { failures: 0, lastFailed: false }
-          h.failures = (h.failures || 0) + 1
-          if (h.failures >= KEY_HEALTH_MAX_FAILURES) h.demotedAt = Date.now()
-          h.lastFailed = true
-          healthData[opencodeKey] = h
+          healthData[opencodeKey] = markKeyFailure(healthData[opencodeKey])
           await writeHealth(c.env, providerId, healthData)
         }
       })())
@@ -509,28 +531,14 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
 
         if (response.status === 429) {
           const retryAfter = parseRetryAfter(response.headers.get('Retry-After'))
-          const h = healthData[apiKey] || { failures: 0, lastFailed: false }
-          if (retryAfter > 0) {
-            // 有 Retry-After：按上游给的精确时间冷却
-            h.cooldownUntil = Date.now() + retryAfter
-          } else {
-            // 无头：走原来的失败计数逻辑，累加 failures，达标后降权
-            h.failures++
-            if (h.failures >= KEY_HEALTH_MAX_FAILURES) h.demotedAt = Date.now()
-          }
-          h.lastFailed = true
-          healthData[apiKey] = h
+          healthData[apiKey] = applyRateLimitHealth(healthData[apiKey], retryAfter)
           healthUpdated = true
           lastError = response
           continue
         }
 
         if (response.status === 401 || response.status === 403 || response.status >= 500 || response.status === 408) {
-          const h = healthData[apiKey] || { failures: 0, lastFailed: false }
-          h.failures++
-          h.lastFailed = true
-          if (h.failures >= KEY_HEALTH_MAX_FAILURES) h.demotedAt = Date.now()
-          healthData[apiKey] = h
+          healthData[apiKey] = markKeyFailure(healthData[apiKey])
           healthUpdated = true
           lastError = response
           continue
@@ -553,11 +561,7 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
         return c.json(result, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
         const error = err as Error
-        const h = healthData[apiKey] || { failures: 0, lastFailed: false }
-        h.failures++
-        h.lastFailed = true
-        if (h.failures >= KEY_HEALTH_MAX_FAILURES) h.demotedAt = Date.now()
-        healthData[apiKey] = h
+        healthData[apiKey] = markKeyFailure(healthData[apiKey])
         healthUpdated = true
         lastError = new Response(JSON.stringify({ error: { message: error.message || '请求失败', type: 'proxy_error' } }), { status: 502, headers: { 'Content-Type': 'application/json' } })
         continue

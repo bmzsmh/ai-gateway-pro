@@ -673,6 +673,9 @@ function editGroup(id) {
   document.getElementById('agtestR').innerHTML = '<p class="form-helper">编辑模式：修改成员后点「保存模型组」。</p>'
   // 临时保存原 ID 供保存用
   window.__editGroupId = id
+  // P0-2 冲突保护：记录打开编辑表单时的 members 快照，保存时携带给后端做冲突检测，
+  // 避免 stale form 覆盖 cron 等操作后加入的 group/* 引用。
+  window.__editGroupSnapshot = [...members]
   document.querySelector('#agf .panel-heading h3').textContent = '编辑模型组：' + id
   const saveBtn = document.querySelector('#agf .panel-actions .btn-p')
   saveBtn.onclick = function() { saveGroup() }
@@ -687,13 +690,16 @@ async function saveGroup() {
   const multimodal = document.getElementById('agmm').checked
   const members = Array.from(document.querySelectorAll('#agmembers .agmi')).map(i => i.value.trim()).filter(Boolean)
   if (members.length === 0) { toast('请至少保留一个成员模型', 'error'); return }
+  // P0-2 冲突保护：携带打开时的快照，后端若发现服务器已变化则返回 409。
+  const expectedMembers = window.__editGroupSnapshot || members
   const r = await fetch('/admin/api/model-groups/' + encodeURIComponent(id), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, members, type, multimodal })
+    body: JSON.stringify({ name, members, type, multimodal, expectedMembers })
   })
   const d = await r.json()
   if (d.success) { toast('模型组已更新'); hideAddGroup(); refreshGroups() }
+  else if (r.status === 409) { toast(d.message || '模型组已被其他操作修改，请刷新后重新编辑', 'error'); refreshGroups() }
   else toast(d.message || '更新失败', 'error')
 }
 function removeGroupMember(id, idx) {
@@ -702,11 +708,14 @@ function removeGroupMember(id, idx) {
   const chips = gi.querySelectorAll('.chip-model')
   const member = chips[idx] ? chips[idx].textContent.trim() : ''
   if (!member) return
+  // P0-2 冲突保护：以当前 DOM chips 为快照，携带 expectedMembers，
+  // 防止页面已过期时把 cron 加入的 group/* 一起删掉。
+  const currentMembers = Array.from(gi.querySelectorAll('.chip-model')).map(c => c.textContent.trim()).filter(t => t && t !== '×')
   const r = fetch('/admin/api/model-groups/' + encodeURIComponent(id), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ members: Array.from(gi.querySelectorAll('.chip-model')).map(c => c.textContent.trim()).filter(t => t && t !== member) })
-  }).then(x => x.json()).then(d => { if (d.success) refreshGroups(); else toast(d.message || '操作失败', 'error') })
+    body: JSON.stringify({ members: currentMembers.filter(t => t !== member), expectedMembers: currentMembers })
+  }).then(x => x.json()).then(d => { if (d.success) refreshGroups(); else if (d.code === 'CONFLICT') { toast(d.message || '模型组已被其他操作修改，请刷新后重新编辑', 'error'); refreshGroups() } else toast(d.message || '操作失败', 'error') })
 }
 async function delGroup(id) {
   if (!confirm('确定删除模型组 ' + id + ' 吗？')) return
