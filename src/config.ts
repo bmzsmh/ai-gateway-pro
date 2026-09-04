@@ -23,6 +23,11 @@ export const KEY_HEALTH_COOLDOWN_MS = 5 * 60 * 1000
 // 连续失败多少次后降权
 export const KEY_HEALTH_MAX_FAILURES = 5
 
+// A3（2026-09-04）：429 未带 Retry-After 时的默认精确冷却时长。
+// 429 属于「上游限流」而非「key 失效」，只冷却、不累加 failures、不触发 demotedAt 降权。
+// 上游给了 Retry-After 就按它冷却（parseRetryAfter 已按 KEY_HEALTH_COOLDOWN_MS 截顶）。
+export const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60 * 1000
+
 // Gateway 请求安全/稳定性默认值；可通过 Worker 环境变量覆盖。
 export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
 export const DEFAULT_MAX_REQUEST_BODY_BYTES = 5 * 1024 * 1024
@@ -47,6 +52,16 @@ export const KV_KEYS = {
 
 /** 模型组 KV key 前缀 */
 export const MODEL_GROUP_KEY = (groupId: string) => `model_group:${groupId}`
+
+/**
+ * 顺序轮转持久化指针 KV key（2026-09-04 A4）。
+ * 指针存 JSON：{"idx": 0}，idx 是 primaryMembers 数组索引（0-based）。
+ * 语义：当前指针指向的成员保持使用直到报错（429/5xx/超时等）才推进；
+ *       推进时跳过冷却中的成员；5 成员环形（5 之后回到 0）。
+ * KV 全局最终一致（~60s 传播 + getModelGroup 60s cacheTtl），
+ * 高并发下短暂读到旧指针属可接受偏差（近似顺序，不保证严格串行）。
+ */
+export const GROUP_POINTER_KEY = (groupId: string) => `group:${groupId}:pointer`
 
 // 有效期选项（秒）
 export const EXPIRY_OPTIONS: Record<string, number | null> = {

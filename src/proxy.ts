@@ -4,14 +4,16 @@ import {
   KV_KEYS,
   KEY_HEALTH_COOLDOWN_MS,
   KEY_HEALTH_MAX_FAILURES,
+  DEFAULT_RATE_LIMIT_COOLDOWN_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
   DEFAULT_MAX_REQUEST_BODY_BYTES,
   MAX_TOTAL_GROUP_ATTEMPTS,
   SAFE_RESOURCE_ID_RE,
   SAFE_MODEL_ID_RE,
   MAX_MODEL_STRING_LENGTH,
+  GROUP_POINTER_KEY,
 } from './config'
-import type { Env, ProxyRequestBody } from './types'
+import type { Env, ProxyRequestBody, Provider } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
 import { maskKey } from './telemetry'
 import { sendAlert, countKvWrite, detectMultimodalFailure, hasImageContent, type AlertType } from './alerts'
@@ -68,11 +70,24 @@ export function markKeyFailure(h: KeyHealth | undefined, now = Date.now()): KeyH
 }
 
 /** 429 带 Retry-After：按上游指定精确时间冷却；无头则走失败计数（markKeyFailure）。 */
+/**
+ * A3（2026-09-04）：429 = 上游限流，不是 key 失效。
+ * - 带 Retry-After → 按上游指定时间精确冷却
+ * - 不带 Retry-After → 用 DEFAULT_RATE_LIMIT_COOLDOWN_MS（60s）兜底冷却
+ * 两种情况都**不累加 failures、不设置 demotedAt**：避免「额度满但一时限流」的账号
+ * 被 failures 无限累积推入永久降权（上游账号级 TPM 限流场景）。
+ * 冷却期满自动恢复；冷却状态由 cooldownUntil 单独表达，指针轮转据此决定是否跳过。
+ */
 function applyRateLimitHealth(h: KeyHealth | undefined, retryAfterMs: number | null, now = Date.now()): KeyHealth {
-  if (retryAfterMs !== null && retryAfterMs > 0) {
-    return { ...(h || { failures: 0, lastFailed: false }), failures: (h?.failures || 0) + 1, lastFailed: true, cooldownUntil: now + retryAfterMs }
+  const base = h && typeof h === 'object' ? { ...h } : { failures: 0, lastFailed: false }
+  const cooldownMs = retryAfterMs !== null && retryAfterMs > 0 ? retryAfterMs : DEFAULT_RATE_LIMIT_COOLDOWN_MS
+  return {
+    ...base,
+    // failures 保持原值（不累加）——429 不计入降权计数
+    failures: base.failures || 0,
+    lastFailed: true,
+    cooldownUntil: now + cooldownMs,
   }
-  return markKeyFailure(h, now)
 }
 
 function getMaxBodyBytes(env: Env): number {
@@ -256,6 +271,81 @@ export async function testModelConnection(
   }
 }
 
+// ===== 顺序轮转持久化指针（2026-09-04 A4） =====
+
+/** 读组指针。缺失（首次部署/数据清空）→ 0（模型 1）。 */
+async function readGroupPointer(env: Env, groupId: string): Promise<number> {
+  try {
+    const raw = await env.KV.get(GROUP_POINTER_KEY(groupId))
+    if (raw) {
+      const parsed = JSON.parse(raw) as { idx?: number }
+      const idx = Number(parsed?.idx)
+      if (Number.isInteger(idx) && idx >= 0) return idx
+    }
+  } catch {
+    // 指针数据损坏 → 从头开始
+  }
+  return 0
+}
+
+/** 写组指针（推进后持久化）。写 KV 失败不阻断请求——最多导致下次仍用旧指针。 */
+async function writeGroupPointer(env: Env, groupId: string, idx: number): Promise<void> {
+  try {
+    await env.KV.put(GROUP_POINTER_KEY(groupId), JSON.stringify({ idx }))
+    await countKvWrite(env)
+  } catch {
+    // 忽略：KV 写入失败不影响请求主链路
+  }
+}
+
+/**
+ * 判断组内成员（provider/model）是否处于「冷却中」。
+ * 判定口径：该 provider 的**全部 enabled key** 都在 cooldownUntil 未到状态才算冷却。
+ * 只要还有任意一把 key 可用，成员就不算冷却（避免多 key provider 被单 key 限流误伤）。
+ */
+async function isMemberCoolingDown(env: Env, member: string, providerMap: Map<string, Provider>): Promise<boolean> {
+  const parsed = parseModelId(member)
+  if (!parsed) return false
+  const provider = providerMap.get(parsed.providerId)
+  if (!provider) return false
+  const enabledKeys = (provider.apiKeys || []).filter(k => k.enabled && k.key)
+  if (enabledKeys.length === 0) return false
+  try {
+    const healthData = await readHealth(env, parsed.providerId)
+    const now = Date.now()
+    return enabledKeys.every(k => {
+      const h = healthData[k.key]
+      return !!(h?.cooldownUntil && h.cooldownUntil > now)
+    })
+  } catch {
+    // 读失败不阻断（视为未冷却，宁可多试一次也不误跳过）
+    return false
+  }
+}
+
+/**
+ * 顺序轮转候选构建（替代原 Math.random 随机起点）：
+ * 从持久化指针 idx 开始环形扫描 primaryMembers，**排除**冷却中的成员。
+ * 返回的 candidates 只含可用成员，按「指针位置 → 环形向后」排序；
+ * 若全部冷却则 candidates 为空 → 由调用方走现有降级到 backup 组的逻辑。
+ */
+async function buildRotationOrder(
+  env: Env,
+  primaryMembers: string[],
+  startIdx: number,
+  providerMap: Map<string, Provider>,
+): Promise<{ candidates: Array<{ member: string; idx: number }>; coolingCount: number }> {
+  const candidates: Array<{ member: string; idx: number }> = []
+  let coolingCount = 0
+  for (let k = 0; k < primaryMembers.length; k++) {
+    const idx = (startIdx + k) % primaryMembers.length
+    const member = primaryMembers[idx]
+    if (await isMemberCoolingDown(env, member, providerMap)) coolingCount++
+    else candidates.push({ member, idx })
+  }
+  return { candidates, coolingCount }
+}
+
 /** 处理 /v1/chat/completions 等 API 转发 */
 export async function handleProxy(c: Context<{ Bindings: Env }>) {
   const requestId = getRequestId(c)
@@ -310,10 +400,34 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       }
 
       if (primaryMembers.length > 0) {
-        const startIdx = Math.floor(Math.random() * primaryMembers.length)
-        for (let k = 0; k < primaryMembers.length && attempts < MAX_TOTAL_GROUP_ATTEMPTS; k++) {
-          const resp = await tryMember(primaryMembers[(startIdx + k) % primaryMembers.length])
-          if (resp) return resp
+        // —— A4 顺序轮转（2026-09-04）：替代 Math.random 随机起点 ——
+        // 指针持久化在 KV group:<id>:pointer。语义：
+        //   · 指针指向的成员能用就一直用（不管用多久），只有它报错才推进
+        //   · 推进时跳过 cooldownUntil 未到的成员（A3 429 精确冷却在此生效）
+        //   · 环形：最后一个之后回到第 0 个
+        //   · 首次部署/指针缺失/数据损坏 → 从 0（模型 1）开始
+        //   · 降级到 XX 后再恢复 CC 不重置指针（指针只在成员报错时推进）
+        const pointerIdx = await readGroupPointer(c.env, modelId)
+        const startIdx = pointerIdx % primaryMembers.length
+        const providerMap = new Map(activeProviders.map(p => [p.id, p]))
+        const { candidates, coolingCount } = await buildRotationOrder(c.env, primaryMembers, startIdx, providerMap)
+        if (coolingCount > 0) {
+          console.log(`[proxy][group:${modelId}] 轮转指针=${startIdx}，${coolingCount}/${primaryMembers.length} 成员冷却中（已跳过）`)
+        }
+        for (const cand of candidates) {
+          if (attempts >= MAX_TOTAL_GROUP_ATTEMPTS) break
+          const resp = await tryMember(cand.member)
+          if (resp) {
+            // 成功：指针粘住当前成员（仅当与已存指针不同才写 KV，避免每请求一次写）
+            if (cand.idx !== pointerIdx) {
+              safeWaitUntil(c, writeGroupPointer(c.env, modelId, cand.idx))
+            }
+            return resp
+          }
+          // 该成员失败 → 指针推进到下一个（环形），持久化后继续尝试下一个候选
+          const advanced = (cand.idx + 1) % primaryMembers.length
+          safeWaitUntil(c, writeGroupPointer(c.env, modelId, advanced))
+          console.log(`[proxy][group:${modelId}] 成员 ${cand.member}(idx=${cand.idx}) 失败 → 指针推进到 idx=${advanced}`)
         }
       }
 
