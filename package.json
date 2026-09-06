@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "typecheck": "tsc --noEmit",
+    "test": "node tests/run-tests.mjs && node tests/run-tests-group-routing.mjs && node tests/run-tests-integration.mjs",
     "build": "wrangler deploy --dry-run",
     "deploy": "wrangler deploy"
   },

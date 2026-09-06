@@ -7,11 +7,11 @@ import {
   DEFAULT_RATE_LIMIT_COOLDOWN_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
   DEFAULT_MAX_REQUEST_BODY_BYTES,
-  MAX_TOTAL_GROUP_ATTEMPTS,
+  MAX_GROUP_SUBREQUEST_BUDGET,
+  FAKE_SUCCESS_COOLDOWN_MS,
   SAFE_RESOURCE_ID_RE,
   SAFE_MODEL_ID_RE,
   MAX_MODEL_STRING_LENGTH,
-  GROUP_POINTER_KEY,
 } from './config'
 import type { Env, ProxyRequestBody, Provider } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
@@ -69,6 +69,26 @@ export function markKeyFailure(h: KeyHealth | undefined, now = Date.now()): KeyH
   return health
 }
 
+/**
+ * S9（2026-09-06）：假成功专用健康度标记 —— 让「识破」变成「记住」。
+ *
+ * 与 markKeyFailure 的区别：额外设 `cooldownUntil = now + FAKE_SUCCESS_COOLDOWN_MS`。
+ * 这一个字段带来三个连锁效果，全部依赖既有机制、无需改动它们：
+ *   1. `writeHealth` 的 P1 过滤白名单包含 `cooldownUntil > now` → **立刻落 KV**，
+ *      跨 isolate 可见（原来 failures=1 永远不落库，坏成员的失败记忆每请求归零）。
+ *   2. `isMemberCoolingDown` 判定该 provider 全 key 冷却 → `buildRotationOrder` 跳过该成员；
+ *      主力全部假成功时 candidates 为空 → 直接降级 backup，**零无效上游调用**。
+ *   3. 冷却期满后 `cooldownUntil <= now` → 成员自动回到候选池 → **CC 自愈返回**。
+ *
+ * failures 仍然累加（与 markKeyFailure 一致）：假成功是**真故障**，不同于 429 限流，
+ * 累计到 KEY_HEALTH_MAX_FAILURES 应当进入 demoted 降权，这与既有语义一致。
+ */
+export function markFakeSuccess(h: KeyHealth | undefined, now = Date.now()): KeyHealth {
+  const health = markKeyFailure(h, now)
+  health.cooldownUntil = now + FAKE_SUCCESS_COOLDOWN_MS
+  return health
+}
+
 /** 429 带 Retry-After：按上游指定精确时间冷却；无头则走失败计数（markKeyFailure）。 */
 /**
  * A3（2026-09-04）：429 = 上游限流，不是 key 失效。
@@ -78,7 +98,7 @@ export function markKeyFailure(h: KeyHealth | undefined, now = Date.now()): KeyH
  * 被 failures 无限累积推入永久降权（上游账号级 TPM 限流场景）。
  * 冷却期满自动恢复；冷却状态由 cooldownUntil 单独表达，指针轮转据此决定是否跳过。
  */
-function applyRateLimitHealth(h: KeyHealth | undefined, retryAfterMs: number | null, now = Date.now()): KeyHealth {
+export function applyRateLimitHealth(h: KeyHealth | undefined, retryAfterMs: number | null, now = Date.now()): KeyHealth {
   const base = h && typeof h === 'object' ? { ...h } : { failures: 0, lastFailed: false }
   const cooldownMs = retryAfterMs !== null && retryAfterMs > 0 ? retryAfterMs : DEFAULT_RATE_LIMIT_COOLDOWN_MS
   return {
@@ -94,21 +114,43 @@ function getMaxBodyBytes(env: Env): number {
   return getPositiveInt(env.MAX_REQUEST_BODY_BYTES, DEFAULT_MAX_REQUEST_BODY_BYTES, 20 * 1024 * 1024)
 }
 
-/** Key 健康度内存缓存：isolate 级 Map，短 TTL（5s）。读时先查内存命中则省一次 KV 读；
+/** Key 健康度内存缓存：isolate 级 Map，短 TTL。读时先查内存命中则省一次 KV 读；
  *  写入仍同步 await 写 KV（不改为 waitUntil 异步，避免更新丢失），同时同步更新内存缓存，
- *  本 isolate 内后续请求立刻可见。跨 isolate 最多 5s 不一致窗口，个人场景可接受。
- *  注意：内存 Map 会随 isolate 生命周期回收，低流量时命中率可能不高——收益实测算。 */
-const HEALTH_MEMORY_CACHE_TTL_MS = 5_000
+ *  本 isolate 内后续请求立刻可见。
+ *
+ *  S10（2026-09-06）**非对称 TTL** —— 修「冷却期内偶发 1 次无效上游调用」：
+ *
+ *  旧行为：无论内容一律缓存 5s。风险场景是「缓存里是空健康度」——
+ *    isolate A 在 t=0 读到空健康度并缓存到 t=5s；t=1s 时 isolate B 发现成员坏了、写入冷却；
+ *    t=2s 请求又落到 isolate A → 命中它那份**已过时的空缓存** → 明知有冷却却仍打一次坏成员。
+ *    L5-3 实测就是这 1 次多余调用。
+ *
+ *  新行为：按内容分档，风险大的那一档几乎不缓存。
+ *    · 非空（存在降权/冷却 key）→ 5s：这份缓存**已经包含**坏 key 信息，续用是安全的，
+ *      而且这正是高频跳过判定的热路径，缓存收益最大。
+ *    · 空（全部健康）→ 1s：恰恰是「我以为都好其实不好」的危险档，把陈旧窗口压到 1/5。
+ *
+ *  代价：全健康时每 provider 每秒最多多 1 次 KV 读。KV 读免费额度 10 万/日、且读不是
+ *  当初 P1 优化的约束对象（P1 省的是**写**），个人量级完全可接受。
+ *
+ *  诚实的边界：这是**收窄**而非**消除**。跨 isolate + KV 最终一致性下，
+ *  1s 内的竞态窗口在架构上无法归零；要归零得引入 Durable Object 强一致状态，
+ *  那是架构改造，不在本次范围。 */
+const HEALTH_CACHE_TTL_DIRTY_MS = 5_000
+const HEALTH_CACHE_TTL_CLEAN_MS = 1_000
 const healthMemoryCache = new Map<string, { data: HealthMap; expiresAt: number }>()
+
+/** S10：按健康度内容选 TTL —— 有坏 key 记录可放心久缓存，全健康则只缓存极短时间。 */
+export function healthCacheTtl(data: HealthMap): number {
+  return Object.keys(data).length > 0 ? HEALTH_CACHE_TTL_DIRTY_MS : HEALTH_CACHE_TTL_CLEAN_MS
+}
 
 async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
   const cached = healthMemoryCache.get(providerId)
   if (cached && cached.expiresAt > Date.now()) {
-    // console.log(`[health][${providerId}] readHealth: MEMORY`)  // 验证用临时日志（已删）
     return cached.data
   }
   const raw = await env.KV.get(HEALTH_KEY(providerId))
-  // console.log(`[health][${providerId}] readHealth: KV`)        // 验证用临时日志（已删）
   let data: HealthMap = {}
   if (raw) {
     try {
@@ -118,7 +160,7 @@ async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
       data = {}
     }
   }
-  healthMemoryCache.set(providerId, { data, expiresAt: Date.now() + HEALTH_MEMORY_CACHE_TTL_MS })
+  healthMemoryCache.set(providerId, { data, expiresAt: Date.now() + healthCacheTtl(data) })
   return data
 }
 
@@ -126,12 +168,13 @@ async function writeHealth(env: Env, providerId: string, health: HealthMap): Pro
   const filtered: HealthMap = {}
   for (const [k, v] of Object.entries(health)) {
     // P1-2026-08-24：只有达到降权阈值（failures>=5）或冷却中的 key 才写 KV。
-    // 1~4 次普通失败仅内存缓存（isolate 内 5s TTL），不落 KV —— 消除偶发失败的 KV 写入。
+    // 1~4 次普通失败仅内存缓存（isolate 内短 TTL），不落 KV —— 消除偶发失败的 KV 写入。
     // 降权（demotedAt）与冷却（cooldownUntil）是路由必需状态，仍需持久化跨 isolate 生效。
+    // S9（2026-09-06）：假成功走 markFakeSuccess 会设 cooldownUntil → 命中本白名单 → 自动落 KV。
     if (v.failures >= KEY_HEALTH_MAX_FAILURES || (v.cooldownUntil && v.cooldownUntil > Date.now())) filtered[k] = v
   }
-  // 先同步更新内存缓存，本 isolate 内后续请求立刻可见
-  healthMemoryCache.set(providerId, { data: filtered, expiresAt: Date.now() + HEALTH_MEMORY_CACHE_TTL_MS })
+  // 先同步更新内存缓存，本 isolate 内后续请求立刻可见（S10：TTL 按内容分档）
+  healthMemoryCache.set(providerId, { data: filtered, expiresAt: Date.now() + healthCacheTtl(filtered) })
   if (Object.keys(filtered).length > 0) {
     // 有降权/冷却 key → 写 KV（跨 isolate 共享降权状态）
     await env.KV.put(HEALTH_KEY(providerId), JSON.stringify(filtered))
@@ -172,9 +215,15 @@ function buildForwardHeaders(c: Context<{ Bindings: Env }>, providerApiType: str
   return headers
 }
 
-function isRetryableGroupStatus(status: number): boolean {
-  return status === 408 || status === 409 || status === 425 || status === 429 || status === 502 || status === 503 || status === 504 || status >= 500 || status === 401 || status === 403
-}
+/**
+ * S7（2026-09-06）：删除死代码 `isRetryableGroupStatus`。
+ *
+ * S3 已移除唯一调用点（`tryMember` 里的 `if (!isRetryableGroupStatus(resp.status)) return resp`）。
+ * 组路由现在的语义是「任何 >=400 都换下一个成员」，不再区分状态码是否可重试，
+ * 因此这个函数没有任何调用方。保留它会让后来的人误以为组路由仍有状态码白名单。
+ *
+ * 注意：opencode.ts 里另有一个 `isRetryableMirrorStatus`，那是镜像回退用的，**仍在使用**，不要动。
+ */
 
 /** 解析模型 ID，如 "deepseek/deepseek-chat" → { providerId, modelId }。
  * 运行时入口的兜底校验：长度上限 + 格式白名单，防止构造超长/非法字符串
@@ -271,39 +320,17 @@ export async function testModelConnection(
   }
 }
 
-// ===== 顺序轮转持久化指针（2026-09-04 A4） =====
-
-/** 读组指针。缺失（首次部署/数据清空）→ 0（模型 1）。 */
-async function readGroupPointer(env: Env, groupId: string): Promise<number> {
-  try {
-    const raw = await env.KV.get(GROUP_POINTER_KEY(groupId))
-    if (raw) {
-      const parsed = JSON.parse(raw) as { idx?: number }
-      const idx = Number(parsed?.idx)
-      if (Number.isInteger(idx) && idx >= 0) return idx
-    }
-  } catch {
-    // 指针数据损坏 → 从头开始
-  }
-  return 0
-}
-
-/** 写组指针（推进后持久化）。写 KV 失败不阻断请求——最多导致下次仍用旧指针。 */
-async function writeGroupPointer(env: Env, groupId: string, idx: number): Promise<void> {
-  try {
-    await env.KV.put(GROUP_POINTER_KEY(groupId), JSON.stringify({ idx }))
-    await countKvWrite(env)
-  } catch {
-    // 忽略：KV 写入失败不影响请求主链路
-  }
-}
+/**
+ * S1（2026-09-06）：回归上游原版随机起点，已删除 A4 的 readGroupPointer / writeGroupPointer。
+ * 保留 isMemberCoolingDown（A4 的有效部分）——它与随机起点不冲突，且是多账号 429 隔离的关键。
+ */
 
 /**
  * 判断组内成员（provider/model）是否处于「冷却中」。
  * 判定口径：该 provider 的**全部 enabled key** 都在 cooldownUntil 未到状态才算冷却。
  * 只要还有任意一把 key 可用，成员就不算冷却（避免多 key provider 被单 key 限流误伤）。
  */
-async function isMemberCoolingDown(env: Env, member: string, providerMap: Map<string, Provider>): Promise<boolean> {
+export async function isMemberCoolingDown(env: Env, member: string, providerMap: Map<string, Provider>): Promise<boolean> {
   const parsed = parseModelId(member)
   if (!parsed) return false
   const provider = providerMap.get(parsed.providerId)
@@ -324,26 +351,31 @@ async function isMemberCoolingDown(env: Env, member: string, providerMap: Map<st
 }
 
 /**
- * 顺序轮转候选构建（替代原 Math.random 随机起点）：
- * 从持久化指针 idx 开始环形扫描 primaryMembers，**排除**冷却中的成员。
- * 返回的 candidates 只含可用成员，按「指针位置 → 环形向后」排序；
- * 若全部冷却则 candidates 为空 → 由调用方走现有降级到 backup 组的逻辑。
+ * S1（2026-09-06）随机轮转候选构建 —— 回归上游原版 `Math.random()` 起点语义。
+ *
+ * 与被删除的 A4 顺序指针版的差异：
+ *   · 起点 = Math.floor(Math.random() * members.length)，**无 KV 读、无 KV 写**
+ *   · 仍然环形扫描全部成员，并**排除**全 key 冷却中的成员（A3 429 精确冷却在此生效）
+ *   · 若全部冷却 → candidates 为空 → 调用方直接走 backup 组降级
+ *
+ * 为什么随机能解决锁死：坏成员被选中的概率是 1/N 而不是 100%，
+ * 任何单成员故障（包含无法被状态码识别的「200 假成功」黑洞）都无法持久占据全部流量。
  */
-async function buildRotationOrder(
+export async function buildRotationOrder(
   env: Env,
   primaryMembers: string[],
-  startIdx: number,
   providerMap: Map<string, Provider>,
-): Promise<{ candidates: Array<{ member: string; idx: number }>; coolingCount: number }> {
+): Promise<{ candidates: Array<{ member: string; idx: number }>; coolingCount: number; startIdx: number }> {
   const candidates: Array<{ member: string; idx: number }> = []
   let coolingCount = 0
+  const startIdx = primaryMembers.length ? Math.floor(Math.random() * primaryMembers.length) : 0
   for (let k = 0; k < primaryMembers.length; k++) {
     const idx = (startIdx + k) % primaryMembers.length
     const member = primaryMembers[idx]
     if (await isMemberCoolingDown(env, member, providerMap)) coolingCount++
     else candidates.push({ member, idx })
   }
-  return { candidates, coolingCount }
+  return { candidates, coolingCount, startIdx }
 }
 
 /** 处理 /v1/chat/completions 等 API 转发 */
@@ -382,8 +414,20 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       // 记录进入 backup 的标记（用于 fallback_failure 告警）
       let wentToBackup = false
 
+      /**
+       * S3（2026-09-06）：任何失败都继续下一个成员 —— 回归上游原版语义。
+       *
+       * 旧行为（v1.2.2 引入的回归）：`if (!isRetryableGroupStatus(resp.status)) return resp`
+       * 把单个成员的「不可重试」状态码（400/404/413/422 等）直接返回给客户端，
+       * 整组其余成员和 backup 组全部被跳过——一个成员配错模型名就能打死整组。
+       *
+       * 新行为：`resp.status < 400` 才算成功；其余一律记入 lastErr 并 `return null`（继续轮转）。
+       * 组路由的语义本来就是「这个成员不行就换下一个」，不需要区分错误可否重试。
+       * 客户端参数错误（缺 model / model 格式错）在进入组路由之前已被拦截，
+       * 所以这里剩下的 4xx 基本都是「该成员自身的问题」而非「请求本身的问题」。
+       */
       const tryMember = async (member: string): Promise<Response | null> => {
-        if (attempts >= MAX_TOTAL_GROUP_ATTEMPTS) return null
+        if (attempts >= MAX_GROUP_SUBREQUEST_BUDGET) return null
         const memberParsed = parseModelId(member)
         if (!memberParsed) return null
         if (!activeProviderIds.has(memberParsed.providerId)) {
@@ -394,40 +438,24 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         const resp = await forwardToProviderModel(c, memberParsed.providerId, memberParsed.modelId, body, model)
         if (resp.status < 400) return resp
         lastErr = resp
-        if (!isRetryableGroupStatus(resp.status)) return resp
-        console.log(`[proxy][group:${modelId}] 成员 ${member} 可重试失败 HTTP ${resp.status}，继续`)
+        console.log(`[proxy][group:${modelId}] 成员 ${member} 失败 HTTP ${resp.status}，尝试下一个`)
         return null
       }
 
       if (primaryMembers.length > 0) {
-        // —— A4 顺序轮转（2026-09-04）：替代 Math.random 随机起点 ——
-        // 指针持久化在 KV group:<id>:pointer。语义：
-        //   · 指针指向的成员能用就一直用（不管用多久），只有它报错才推进
-        //   · 推进时跳过 cooldownUntil 未到的成员（A3 429 精确冷却在此生效）
-        //   · 环形：最后一个之后回到第 0 个
-        //   · 首次部署/指针缺失/数据损坏 → 从 0（模型 1）开始
-        //   · 降级到 XX 后再恢复 CC 不重置指针（指针只在成员报错时推进）
-        const pointerIdx = await readGroupPointer(c.env, modelId)
-        const startIdx = pointerIdx % primaryMembers.length
+        // —— S1/S2（2026-09-06）：随机起点 + 遍历全部主力成员 ——
+        //   · 起点随机（回归上游原版），坏成员影响面 = 1/N，不再有粘滞指针放大故障
+        //   · 遍历**全部**候选，不再受「主力+backup 共享 6 次」预算限制 → backup 必然拿到机会
+        //   · 仍跳过全 key 冷却成员（A3 429 精确冷却在此生效）
+        //   · 无 KV 读写：省掉每次路由的指针读 + 推进写
         const providerMap = new Map(activeProviders.map(p => [p.id, p]))
-        const { candidates, coolingCount } = await buildRotationOrder(c.env, primaryMembers, startIdx, providerMap)
+        const { candidates, coolingCount, startIdx } = await buildRotationOrder(c.env, primaryMembers, providerMap)
         if (coolingCount > 0) {
-          console.log(`[proxy][group:${modelId}] 轮转指针=${startIdx}，${coolingCount}/${primaryMembers.length} 成员冷却中（已跳过）`)
+          console.log(`[proxy][group:${modelId}] 随机起点=${startIdx}，${coolingCount}/${primaryMembers.length} 成员冷却中（已跳过）`)
         }
         for (const cand of candidates) {
-          if (attempts >= MAX_TOTAL_GROUP_ATTEMPTS) break
           const resp = await tryMember(cand.member)
-          if (resp) {
-            // 成功：指针粘住当前成员（仅当与已存指针不同才写 KV，避免每请求一次写）
-            if (cand.idx !== pointerIdx) {
-              safeWaitUntil(c, writeGroupPointer(c.env, modelId, cand.idx))
-            }
-            return resp
-          }
-          // 该成员失败 → 指针推进到下一个（环形），持久化后继续尝试下一个候选
-          const advanced = (cand.idx + 1) % primaryMembers.length
-          safeWaitUntil(c, writeGroupPointer(c.env, modelId, advanced))
-          console.log(`[proxy][group:${modelId}] 成员 ${cand.member}(idx=${cand.idx}) 失败 → 指针推进到 idx=${advanced}`)
+          if (resp) return resp
         }
       }
 
@@ -440,15 +468,18 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       }
 
       for (const subRef of backupGroups) {
-        if (attempts >= MAX_TOTAL_GROUP_ATTEMPTS) break
+        if (attempts >= MAX_GROUP_SUBREQUEST_BUDGET) break
         const subParsed = parseModelId(subRef)
         if (!subParsed || subParsed.providerId !== 'group') continue
         const subGroup = await getModelGroup(c.env, subParsed.modelId)
         if (!subGroup?.enabled || subGroup.members.length === 0) continue
         wentToBackup = true
         const subPrimary = subGroup.members.filter(m => !m.startsWith('group/'))
+        // S1/S2（2026-09-06）：backup 组同样随机起点 + 遍历全部成员。
+        // 与主力一致的语义（旧版 backup 也是 Math.random 起点，但与主力共享 6 次预算而饿死）。
         const subStart = subPrimary.length ? Math.floor(Math.random() * subPrimary.length) : 0
-        for (let k = 0; k < subPrimary.length && attempts < MAX_TOTAL_GROUP_ATTEMPTS; k++) {
+        console.log(`[proxy][group:${modelId}] 降级到 backup ${subRef}，随机起点=${subStart}/${subPrimary.length}`)
+        for (let k = 0; k < subPrimary.length; k++) {
           const resp = await tryMember(subPrimary[(subStart + k) % subPrimary.length])
           if (resp) return resp
         }
@@ -507,6 +538,86 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
   }
 }
 
+/**
+ * S4（2026-09-06）流式首包 SSE error 探测 —— 本次故障的**根因修复**。
+ *
+ * 问题：上游（实测 AMD `developer.amd.com.cn`）在忙时返回 `HTTP 200 + text/event-stream`，
+ * 但流的第一个事件就是 `event: error` / `data: {"error":{...}}`。旧代码 `if (response.ok)`
+ * 判成功 → 直传 body → 还把该 key 的 failures 清零 → 客户端 openai SDK 在
+ * `_streaming.py:__stream__` 抛 APIError。网关**自认为成功**，因此：
+ *   · 不推进/不换成员、不降级 backup 组、不发 tier_degrade 告警、不记 markKeyFailure
+ * 这就是「CC 组不降 XX、零告警、直接跌客户端保底」的真正机制。
+ *
+ * 修复：只读第一个 chunk 做判定，然后把它拼回流继续转发（零额外延迟、不缓冲全流）。
+ *   · 命中 error 结构 → 视为该成员失败（markKeyFailure + lastError），继续轮转下一个 key/成员
+ *   · 未命中 → 用 ReadableStream 把首块 enqueue 回去，其余 chunk 原样透传
+ *
+ * 宽容判定原则（避免误杀）：只在**明确匹配 SSE error 事件或 error 对象**时判失败。
+ *   · `: keep-alive` / `: ping` 等 SSE 注释行 → 放行
+ *   · 正常 `data: {"choices":[...]}` → 放行
+ *   · 正文里恰好出现 "error" 字样（如模型在讲错误处理）→ 不匹配（要求 error 是 JSON key 或 event 名）
+ *
+ * S8（2026-09-06）门槛修正 —— **必须按响应侧 content-type 判定，不能只看请求侧 stream 参数**。
+ *
+ * 实测依据：AMD 上游在 `stream: false` 时**同样**返回 `HTTP 200 + content-type: text/event-stream`
+ * + `event: error`（本地 mock 复现 6/6）。S4 初版把门槛写成 `if (isStreamRequest && …)`，
+ * 导致非流式请求命中假成功成员时，探测被完全跳过：
+ *   · 客户端收到 `HTTP 200 + text/event-stream + event: error`（非流式 SDK 直接解析失败）
+ *   · 更糟的是走到下面的 `delete healthData[apiKey]` 把该 key 的失败计数**清零**
+ *     —— 正是本次故障"网关自认为成功、永不降级"的同一条机制，只是换了非流式入口
+ *
+ * 修正后的门槛：`isStreamRequest || 响应 content-type 含 text/event-stream`。
+ * 非 SSE 的普通 JSON 响应完全不进探测分支，多模态检测（response.clone().text()）路径不受影响。
+ */
+export const SSE_ERROR_RE = /(^|\n)\s*event:\s*error\b|"error"\s*:\s*[{"]/
+
+/** 响应是否为 SSE 流（与请求是否声明 stream 无关）——S8 门槛判定依据。 */
+export function isSseResponse(response: Response): boolean {
+  return /text\/event-stream/i.test(response.headers.get('content-type') || '')
+}
+
+/** 读首块做 error 判定，返回 { isError, first, reader }。首块为空（立即 EOF）不判错。 */
+export async function probeStreamHead(response: Response): Promise<{
+  isError: boolean
+  headText: string
+  first: Uint8Array | undefined
+  reader: ReadableStreamDefaultReader<Uint8Array>
+} | null> {
+  if (!response.body) return null
+  const reader = response.body.getReader()
+  try {
+    const { value, done } = await reader.read()
+    if (done || !value) return { isError: false, headText: '', first: undefined, reader }
+    const headText = new TextDecoder().decode(value)
+    return { isError: SSE_ERROR_RE.test(headText), headText, first: value, reader }
+  } catch {
+    // 首包读取失败（连接中断等）→ 交回调用方按失败处理
+    try { await reader.cancel() } catch { /* ignore */ }
+    return null
+  }
+}
+
+/** 把已消费的首块拼回流，其余 chunk 原样透传。 */
+export function restoreStream(first: Uint8Array | undefined, reader: ReadableStreamDefaultReader<Uint8Array>): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (first) controller.enqueue(first)
+    },
+    async pull(controller) {
+      try {
+        const { value, done } = await reader.read()
+        if (done) { controller.close(); return }
+        if (value) controller.enqueue(value)
+      } catch (err) {
+        controller.error(err)
+      }
+    },
+    cancel(reason) {
+      try { void reader.cancel(reason) } catch { /* ignore */ }
+    },
+  })
+}
+
 async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId: string, modelId: string, body: ProxyRequestBody, routeKey: string): Promise<Response> {
   const requestId = getRequestId(c)
   try {
@@ -524,6 +635,8 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
     const url = new URL(c.req.url)
     const subPath = url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
     const timeoutMs = getRequestTimeoutMs(c.env)
+    // S6（2026-09-06）：上移到此处，让 opencode 分支也能用（原先声明在 opencode 分支之后）。
+    const isStreamRequest = !!(forwardBody as { stream?: unknown }).stream
 
     if (isOpenCodeProvider(providerId)) {
       const response = await proxyOpenCodeRequest({
@@ -538,6 +651,47 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
       })
       const keyMasked = maskKey(enabledKeys[0]?.key || '')
       const opencodeKey = enabledKeys[0]?.key || 'public'
+
+      /**
+       * S6（2026-09-06）：opencode 路径的流式假成功探测。
+       *
+       * 必要性：`opencode/*-free` 是 backup 组 `group/xx` 的实际主力成员。S4 只覆盖了通用
+       * provider 分支，opencode 走独立的 `proxyOpenCodeRequest`（官方 key 轮换 + 镜像回退），
+       * 返回后同样是 `new Response(response.body, …)` 盲转 —— 同一个「HTTP 200 + 流内 error」
+       * 黑洞在 backup 层没有被堵住。若 backup 成员也吐假成功，S4 修好的主力降级会重新落空。
+       *
+       * 处理：命中 error → 记 markKeyFailure 并返回 502，让组路由的 tryMember 看到 >=400
+       * 继续换下一个成员；未命中 → 首块拼回流原样透传。
+       */
+      if ((isStreamRequest || isSseResponse(response)) && response.ok && response.body) {
+        const probe = await probeStreamHead(response)
+        if (!probe || probe.isError) {
+          try { await probe?.reader.cancel() } catch { /* ignore */ }
+          const headSnippet = (probe?.headText || '').substring(0, 300)
+          console.log(`[proxy] opencode/${modelId} key=${keyMasked} 假成功（HTTP 200 + 流内 error），判失败继续轮转: ${headSnippet.replace(/\s+/g, ' ')}`)
+          safeWaitUntil(c, (async () => {
+            const healthData = await readHealth(c.env, providerId)
+            // S9（2026-09-06）：opencode 路径同样用 markFakeSuccess（落 KV + 60s 冷却 + 自愈）。
+            healthData[opencodeKey] = markFakeSuccess(healthData[opencodeKey])
+            await writeHealth(c.env, providerId, healthData)
+          })())
+          return new Response(JSON.stringify({
+            error: {
+              message: 'OpenCode 上游返回 HTTP 200 但流内为错误事件（假成功）',
+              type: 'upstream_stream_error',
+              detail: headSnippet,
+              request_id: requestId,
+            },
+          }), { status: 502, headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-Request-ID': requestId } })
+        }
+        const streamHeaders = copySafeResponseHeaders(response.headers)
+        streamHeaders.set('X-Request-ID', requestId)
+        return new Response(restoreStream(probe.first, probe.reader), {
+          status: response.status,
+          statusText: response.statusText,
+          headers: streamHeaders,
+        })
+      }
 
       const headers = copySafeResponseHeaders(response.headers)
       headers.set('X-Request-ID', requestId)
@@ -599,7 +753,7 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
 
     let lastError: Response | null = null
     let healthUpdated = false
-    const isStreamRequest = !!(forwardBody as { stream?: unknown }).stream
+    // S6（2026-09-06）：isStreamRequest 已上移到函数顶部（opencode 分支之前），此处不再重复声明。
 
     for (const keyIndex of keyOrder) {
       const apiKey = enabledKeys[keyIndex].key
@@ -616,6 +770,54 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
         })
 
         if (response.ok) {
+          // —— S4（2026-09-06）：流式请求先探测首包，识破「HTTP 200 + 流内 error」假成功 ——
+          // S8（2026-09-06）：门槛改为「请求声明 stream **或** 响应 content-type 是 SSE」，
+          // 因为 AMD 类上游在 stream:false 时同样返回 SSE + event: error（实测 6/6）。
+          if ((isStreamRequest || isSseResponse(response)) && response.body) {
+            const probe = await probeStreamHead(response)
+            if (!probe) {
+              // 首包读取失败：按该 key 失败处理，继续下一个 key
+              healthData[apiKey] = markKeyFailure(healthData[apiKey])
+              healthUpdated = true
+              lastError = new Response(JSON.stringify({ error: { message: '流式响应首包读取失败', type: 'stream_head_error' } }), { status: 502, headers: { 'Content-Type': 'application/json' } })
+              continue
+            }
+            if (probe.isError) {
+              // 假成功：上游 HTTP 200 但流内立刻是 error 事件。
+              // 关键点：**必须记 markKeyFailure**（旧代码在这里反而 delete 掉了失败计数），
+              // 并且 return null 语义（continue）让上层组路由继续换成员/降级 backup。
+              try { await probe.reader.cancel() } catch { /* ignore */ }
+              // S9（2026-09-06）：markKeyFailure → markFakeSuccess，额外设 60s 冷却。
+              // 只加一个 cooldownUntil 字段就让 writeHealth 的 P1 白名单收下它 → 落 KV 跨 isolate 可见
+              // → 下个请求 isMemberCoolingDown 直接跳过该成员（零无效调用），冷却期满自动回归轮转。
+              healthData[apiKey] = markFakeSuccess(healthData[apiKey])
+              healthUpdated = true
+              const headSnippet = probe.headText.substring(0, 300)
+              console.log(`[proxy] ${providerId}/${modelId} key=${keyMasked} 假成功（HTTP 200 + 流内 error），判失败继续轮转: ${headSnippet.replace(/\s+/g, ' ')}`)
+              lastError = new Response(JSON.stringify({
+                error: {
+                  message: `上游返回 HTTP 200 但流内为错误事件（假成功）`,
+                  type: 'upstream_stream_error',
+                  detail: headSnippet,
+                },
+              }), { status: 502, headers: { 'Content-Type': 'application/json' } })
+              continue
+            }
+            // 真成功：清理健康度 + 把首块拼回流转发
+            if (healthData[apiKey]?.failures > 0 || healthData[apiKey]?.cooldownUntil) {
+              delete healthData[apiKey]
+              healthUpdated = true
+            }
+            const streamHeaders = copySafeResponseHeaders(response.headers)
+            streamHeaders.set('X-Request-ID', requestId)
+            if (healthUpdated) await writeHealth(c.env, providerId, healthData)
+            return new Response(restoreStream(probe.first, probe.reader), {
+              status: response.status,
+              statusText: response.statusText,
+              headers: streamHeaders,
+            })
+          }
+
           if (healthData[apiKey]?.failures > 0 || healthData[apiKey]?.cooldownUntil) {
             delete healthData[apiKey]
             healthUpdated = true
@@ -705,7 +907,7 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
   }
 }
 
-function parseRetryAfter(value: string | null): number {
+export function parseRetryAfter(value: string | null): number {
   if (!value) return 0
   const seconds = Number(value)
   if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, KEY_HEALTH_COOLDOWN_MS)

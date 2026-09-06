@@ -31,7 +31,29 @@ export const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60 * 1000
 // Gateway 请求安全/稳定性默认值；可通过 Worker 环境变量覆盖。
 export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
 export const DEFAULT_MAX_REQUEST_BODY_BYTES = 5 * 1024 * 1024
-export const MAX_TOTAL_GROUP_ATTEMPTS = 6
+
+// S2（2026-09-06）：替代旧 MAX_TOTAL_GROUP_ATTEMPTS = 6。
+// 旧语义是「主力 + backup 共享 6 次路由预算」——主力成员数 > 6 时 backup 一次机会都拿不到（饿死）。
+// 新语义：**路由预算按层各自的成员数**（主力遍历 primaryMembers.length、backup 遍历各自 subPrimary.length），
+// 这里的常量退化为**纯防御性熔断**，只用来兜住 CF Workers 单请求 subrequest 上限（免费版 50 / 付费 1000），
+// 绝不参与正常路由决策。取 20：cc(7) + xx(4) = 11 个成员即使每个都试也远低于它。
+export const MAX_GROUP_SUBREQUEST_BUDGET = 20
+
+// S9（2026-09-06）：假成功（HTTP 200 + 流内 error）专用冷却时长。
+//
+// 为什么需要它 —— S4/S6/S8 只解决了「识破 + 换成员」，没解决「记住」：
+//   writeHealth 的 P1 过滤只持久化 `failures>=5 || cooldownUntil>now` 的 key，
+//   而每个请求是独立 isolate、healthMemoryCache 不跨 isolate 共享，
+//   于是 failures 永远停在 1，**永不落 KV** → 下一个请求的新 isolate 读到空健康度
+//   → 坏成员以 1/N 概率再次被选中 → 每次都要重新付一次探测代价。
+//   实测：opencode 连打 6 次，`key:health:opencode` 始终不存在。
+//
+// 解法不动 P1 阈值（那是为省 KV 写配额的既有取舍），而是给假成功一个**短冷却**：
+//   · `cooldownUntil > now` 本来就在 P1 白名单里 → 自动落 KV，零阈值改动
+//   · `isMemberCoolingDown` 据此跳过该成员 → 主力全假成功时 candidates 直接为空 → 立刻降级 backup
+//   · 冷却期满自动回到轮转 → 这就是「CC 降 XX 后再返回 CC」的自愈路径
+// 取 60s 与 429 默认冷却对齐：够短（不误伤偶发抖动）、够长（覆盖 KV ~60s 边缘缓存传播窗口）。
+export const FAKE_SUCCESS_COOLDOWN_MS = 60 * 1000
 
 // 仅允许安全的 Provider / Group ID，避免被拼入 URL / HTML / JS 上下文。
 export const SAFE_RESOURCE_ID_RE = /^[A-Za-z0-9_-]+$/
@@ -54,14 +76,15 @@ export const KV_KEYS = {
 export const MODEL_GROUP_KEY = (groupId: string) => `model_group:${groupId}`
 
 /**
- * 顺序轮转持久化指针 KV key（2026-09-04 A4）。
- * 指针存 JSON：{"idx": 0}，idx 是 primaryMembers 数组索引（0-based）。
- * 语义：当前指针指向的成员保持使用直到报错（429/5xx/超时等）才推进；
- *       推进时跳过冷却中的成员；5 成员环形（5 之后回到 0）。
- * KV 全局最终一致（~60s 传播 + getModelGroup 60s cacheTtl），
- * 高并发下短暂读到旧指针属可接受偏差（近似顺序，不保证严格串行）。
+ * S1（2026-09-06）：已删除 A4 顺序轮转持久化指针 `GROUP_POINTER_KEY`。
+ *
+ * 删除原因（实测根因）：粘滞指针是故障放大器。指针停在一个「HTTP 200 + SSE 流内 error」
+ * 的假成功成员上时，tryMember 永远判成功 → 指针永不推进 → 每个请求都命中同一黑洞，
+ * 且不触发任何降级、不发告警。回归上游原版（yutian81/ai-gateway，私仓 v1.0 封箱基线）的
+ * 随机起点后，单个坏成员的影响面被摊薄到 1/N，不再形成持久锁死。
+ *
+ * 遗留数据：KV 中旧的 `group:<id>:pointer` 键不再被读写，属无害孤儿键，可手动清理。
  */
-export const GROUP_POINTER_KEY = (groupId: string) => `group:${groupId}:pointer`
 
 // 有效期选项（秒）
 export const EXPIRY_OPTIONS: Record<string, number | null> = {

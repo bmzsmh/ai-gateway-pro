@@ -4,6 +4,17 @@ export type AlertType = 'kv_quota' | 'tier_degrade' | 'fallback_failure' | 'mult
 
 interface DebounceState {
   lastSent: number
+  /**
+   * S5（2026-09-06）语义修正：`count` = **自上次实际推送以来被抑制（静默丢弃）的次数**。
+   *
+   * 旧语义是"累计总次数、从不清零"，导致告警文案说谎：生产 KV 实测
+   * `alert:debounce:tier_degrade:group:cc` = {"lastSent":1788543450363,"count":71}，
+   * lastSent 是 2026-09-05 01:37:30 CST，而文案写死"过去 5 分钟内该问题共发生 71 次" ——
+   * 71 是这个键创建以来的全时段总数，不是 5 分钟内的数字。
+   * 告警是用户观测降级的唯一入口，数字说谎会直接误导故障判断。
+   *
+   * 新语义：推送后清零，下个窗口重新累计；文案改为"距上次通知期间"并带上真实窗口长度。
+   */
   count: number
 }
 
@@ -45,7 +56,11 @@ async function sendTg(env: Env, text: string): Promise<boolean> {
 }
 
 // ===== 防抖检查 =====
-async function checkDebounce(env: Env, type: AlertType, scope: string): Promise<{ ok: boolean; count: number }> {
+/**
+ * S5（2026-09-06）：返回 `suppressed`（被抑制次数）+ `silentMs`（距上次推送的真实间隔），
+ * 供调用方生成不说谎的文案；推送后 count 清零。
+ */
+async function checkDebounce(env: Env, type: AlertType, scope: string): Promise<{ ok: boolean; suppressed: number; silentMs: number }> {
   const key = `alert:debounce:${type}:${scope}`
   const raw = await env.KV.get(key)
   const now = Date.now()
@@ -54,26 +69,24 @@ async function checkDebounce(env: Env, type: AlertType, scope: string): Promise<
   if (raw) {
     try {
       const state = JSON.parse(raw) as DebounceState
+      const suppressed = Number.isFinite(state.count) ? state.count : 0
       if (now - state.lastSent < windowMs) {
-        // 窗口期内：累计计数，不发送
-        state.count++
-        await env.KV.put(key, JSON.stringify(state))
+        // 窗口期内：累计被抑制次数，不发送
+        await env.KV.put(key, JSON.stringify({ lastSent: state.lastSent, count: suppressed + 1 }))
         await countKvWrite(env)
-        return { ok: false, count: state.count }
+        return { ok: false, suppressed: suppressed + 1, silentMs: now - state.lastSent }
       }
-      // 窗口已过：如果之前有累计，发送汇总消息
-      state.count++
-      state.lastSent = now
-      await env.KV.put(key, JSON.stringify(state))
+      // 窗口已过：推送，并把被抑制计数清零（S5：不再无限累加）
+      await env.KV.put(key, JSON.stringify({ lastSent: now, count: 0 }))
       await countKvWrite(env)
-      return { ok: true, count: state.count }
+      return { ok: true, suppressed, silentMs: now - state.lastSent }
     } catch { /* fall through */ }
   }
 
   // 首次触发
-  await env.KV.put(key, JSON.stringify({ lastSent: now, count: 1 }))
+  await env.KV.put(key, JSON.stringify({ lastSent: now, count: 0 }))
   await countKvWrite(env)
-  return { ok: true, count: 1 }
+  return { ok: true, suppressed: 0, silentMs: 0 }
 }
 
 // ===== 后台记录告警 =====
@@ -99,7 +112,7 @@ export async function sendAlert(
   title: string,
   detail: string,
 ): Promise<void> {
-  const { ok, count } = await checkDebounce(env, type, scope)
+  const { ok, suppressed, silentMs } = await checkDebounce(env, type, scope)
   if (!ok) {
     // 防抖窗口内不推送，但仍记录后台日志
     await recordAlert(env, type, detail, title)
@@ -107,8 +120,11 @@ export async function sendAlert(
   }
 
   let text = `${title}\n${detail}`
-  if (count > 1) {
-    text += `\n\n📊 过去 5 分钟内该问题共发生 <b>${count}</b> 次`
+  if (suppressed > 0) {
+    // S5（2026-09-06）：文案基于真实的静默区间，不再写死"过去 5 分钟"。
+    const mins = Math.round(silentMs / 60_000)
+    const span = mins >= 60 ? `${(mins / 60).toFixed(1)} 小时` : `${mins} 分钟`
+    text += `\n\n📊 距上次通知约 ${span} 内，该问题另有 <b>${suppressed}</b> 次被防抖抑制`
   }
   await sendTg(env, text)
   await recordAlert(env, type, detail, title)
@@ -182,11 +198,14 @@ export async function countKvWrite(env: Env): Promise<void> {
       const warnedKey = `alert:kv_warned:${today}`
       const warned = await env.KV.get(warnedKey)
       if (!warned) {
+        // 【修复互递归】先写 warnedKey，再调用 sendAlert
+        // sendAlert -> checkDebounce -> countKvWrite 会再次进到这里
+        // 如果不先写，递归层会读到 warned=null，无限递归
+        await env.KV.put(warnedKey, '1', { expirationTtl: 86400 })
         await sendAlert(env, 'kv_quota', 'global',
           `⚠️ <b>KV 写入配额预警</b>`,
           `当前写入量约 ${total} / ${KV_WRITE_DAILY_LIMIT} (${Math.round(total / KV_WRITE_DAILY_LIMIT * 100)}%)\n每日剩余配额：${KV_WRITE_DAILY_LIMIT - total} 次`
         )
-        await env.KV.put(warnedKey, '1', { expirationTtl: 86400 })
       }
     }
   } catch { /* skip */ }
