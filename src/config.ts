@@ -29,7 +29,7 @@ export const KEY_HEALTH_MAX_FAILURES = 5
 export const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60 * 1000
 
 // Gateway 请求安全/稳定性默认值；可通过 Worker 环境变量覆盖。
-export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
+export const DEFAULT_REQUEST_TIMEOUT_MS = 25_000
 export const DEFAULT_MAX_REQUEST_BODY_BYTES = 5 * 1024 * 1024
 
 // S2（2026-09-06）：替代旧 MAX_TOTAL_GROUP_ATTEMPTS = 6。
