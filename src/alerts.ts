@@ -188,35 +188,26 @@ export async function countKvWrite(env: Env): Promise<void> {
   const today = new Date().toISOString().slice(0, 10)
   const key = `alert:kv_count:${today}`
 
-  // 每次调用都检查阈值（读 KV 获取已持久化的计数）
-  try {
-    const raw = await env.KV.get(key)
-    const stored = raw ? parseInt(raw, 10) : 0
-    const total = stored + kvWriteBuffer
-
-    if (total >= Math.floor(KV_WRITE_DAILY_LIMIT * KV_WRITE_ALERT_PCT)) {
-      const warnedKey = `alert:kv_warned:${today}`
-      const warned = await env.KV.get(warnedKey)
-      if (!warned) {
-        // 【修复互递归】先写 warnedKey，再调用 sendAlert
-        // sendAlert -> checkDebounce -> countKvWrite 会再次进到这里
-        // 如果不先写，递归层会读到 warned=null，无限递归
-        await env.KV.put(warnedKey, '1', { expirationTtl: 86400 })
-        await sendAlert(env, 'kv_quota', 'global',
-          `⚠️ <b>KV 写入配额预警</b>`,
-          `当前写入量约 ${total} / ${KV_WRITE_DAILY_LIMIT} (${Math.round(total / KV_WRITE_DAILY_LIMIT * 100)}%)\n每日剩余配额：${KV_WRITE_DAILY_LIMIT - total} 次`
-        )
-      }
-    }
-  } catch { /* skip */ }
-
-  // 每 20 次批量写回 KV（减少写入次数）
+  // 只在 buffer 满（20 次）时读一次 KV 拿持久化计数并写回；平时只累加内存计数。
+  // 目的：每次调用都读 KV 是 1102 的串行 KV 读热点之一。
   if (kvWriteBuffer >= 20) {
     try {
       const raw = await env.KV.get(key)
       const count = raw ? parseInt(raw, 10) + kvWriteBuffer : kvWriteBuffer
       await env.KV.put(key, String(count), { expirationTtl: 86400 * 2 })
       kvWriteBuffer = 0
+      // 批量写回后检查一次阈值（读 1 次 KV，不每次读）
+      if (count >= Math.floor(KV_WRITE_DAILY_LIMIT * KV_WRITE_ALERT_PCT)) {
+        const warnedKey = `alert:kv_warned:${today}`
+        const warned = await env.KV.get(warnedKey)
+        if (!warned) {
+          await env.KV.put(warnedKey, '1', { expirationTtl: 86400 })
+          await sendAlert(env, 'kv_quota', 'global',
+            `⚠️ <b>KV 写入配额预警</b>`,
+            `当前写入量约 ${count} / ${KV_WRITE_DAILY_LIMIT} (${Math.round(count / KV_WRITE_DAILY_LIMIT * 100)}%)\n每日剩余配额：${KV_WRITE_DAILY_LIMIT - count} 次`
+          )
+        }
+      }
     } catch { /* skip */ }
   }
 }

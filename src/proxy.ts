@@ -367,14 +367,14 @@ export async function buildRotationOrder(
   providerMap: Map<string, Provider>,
 ): Promise<{ candidates: Array<{ member: string; idx: number }>; coolingCount: number; startIdx: number }> {
   const candidates: Array<{ member: string; idx: number }> = []
-  let coolingCount = 0
   const startIdx = primaryMembers.length ? Math.floor(Math.random() * primaryMembers.length) : 0
-  for (let k = 0; k < primaryMembers.length; k++) {
+  const order = Array.from({ length: primaryMembers.length }, (_, k) => {
     const idx = (startIdx + k) % primaryMembers.length
-    const member = primaryMembers[idx]
-    if (await isMemberCoolingDown(env, member, providerMap)) coolingCount++
-    else candidates.push({ member, idx })
-  }
+    return { member: primaryMembers[idx], idx }
+  })
+  const coolingFlags = await Promise.all(order.map(o => isMemberCoolingDown(env, o.member, providerMap)))
+  const coolingCount = coolingFlags.filter(Boolean).length
+  coolingFlags.forEach((cooling, i) => { if (!cooling) candidates.push(order[i]) })
   return { candidates, coolingCount, startIdx }
 }
 
