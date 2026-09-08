@@ -1,0 +1,12 @@
+name = "ai-gateway-pro"
+main = "src/index.ts"
+compatibility_date = "2025-07-01"
+compatibility_flags = ["nodejs_compat"]
+usage_model = "standard"
+
+[vars]
+# 生产环境变量通过 wrangler secret / dashboard 配置
+
+[[kv_namespaces]]
+binding = "KV"
+id = " <YOUR_PROD_KV_NAMESPACE_ID>"

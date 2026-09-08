@@ -139,6 +139,10 @@ function getMaxBodyBytes(env: Env): number {
 const HEALTH_CACHE_TTL_DIRTY_MS = 5_000
 const HEALTH_CACHE_TTL_CLEAN_MS = 1_000
 const healthMemoryCache = new Map<string, { data: HealthMap; expiresAt: number }>()
+/** P2（2026-09-08）：同 isolate 内已清空的 provider 集合 —— 避免健康 member 恢复后每请求都 delete KV。 */
+const clearedHealthKeys = new Set<string>()
+/** P3（2026-09-08）：请求内 provider 健康数据缓存 —— buildRotationOrder 遍历同一 provider 的多个成员时只读一次 KV。 */
+const requestHealthCache = new Map<string, HealthMap>()
 
 /** S10：按健康度内容选 TTL —— 有坏 key 记录可放心久缓存，全健康则只缓存极短时间。 */
 export function healthCacheTtl(data: HealthMap): number {
@@ -164,6 +168,26 @@ async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
   return data
 }
 
+/**
+ * P4（2026-09-08）：健康度规范化 —— 排序 key 后输出稳定 JSON，用于跨次写入的内容 diff。
+ * 不做规范化会因对象 key 插入顺序不同产生假差异（同一状态被判为"变了"而重复写 KV）。
+ */
+function canonicalHealth(data: HealthMap): string {
+  const keys = Object.keys(data).sort()
+  const out: HealthMap = {} as HealthMap
+  for (const k of keys) {
+    const v = data[k]
+    // 归一化：省略 undefined 字段，数值统一（避免 0 与 undefined 造成假差异）
+    out[k] = {
+      failures: v.failures || 0,
+      lastFailed: !!v.lastFailed,
+      ...(v.demotedAt ? { demotedAt: v.demotedAt } : {}),
+      ...(v.cooldownUntil ? { cooldownUntil: v.cooldownUntil } : {}),
+    }
+  }
+  return JSON.stringify(out)
+}
+
 async function writeHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
   const filtered: HealthMap = {}
   for (const [k, v] of Object.entries(health)) {
@@ -176,13 +200,44 @@ async function writeHealth(env: Env, providerId: string, health: HealthMap): Pro
   // 先同步更新内存缓存，本 isolate 内后续请求立刻可见（S10：TTL 按内容分档）
   healthMemoryCache.set(providerId, { data: filtered, expiresAt: Date.now() + healthCacheTtl(filtered) })
   if (Object.keys(filtered).length > 0) {
-    // 有降权/冷却 key → 写 KV（跨 isolate 共享降权状态）
-    await env.KV.put(HEALTH_KEY(providerId), JSON.stringify(filtered))
-    await countKvWrite(env)
+    // P4（2026-09-08）：canonical diff —— 与 KV 里已持久化的内容做精确比对，
+    // 只在「规范化后的 JSON 不同」时才写。这样：
+    //   · 429 刷新冷却窗口（failures/cooldownUntil 变化）→ 内容变了，正常写（路由必需）
+    //   · 同一冷却期内重复失败（failures 5→6→7…）→ 内容未变，跳过写
+    //   · 首次跨过降权阈值 → 内容从 {} 变为有值，写
+    // 稳态（成员持续坏/持续好）下每个 provider 每个冷却周期只写 1 次。
+    const canonical = canonicalHealth(filtered)
+    try {
+      const prevRaw = await env.KV.get(HEALTH_KEY(providerId))
+      let prevCanonical = ''
+      if (prevRaw) {
+        try { prevCanonical = canonicalHealth(JSON.parse(prevRaw) as HealthMap) } catch { /* ignore */ }
+      }
+      if (prevCanonical !== canonical) {
+        clearedHealthKeys.delete(providerId)
+        await env.KV.put(HEALTH_KEY(providerId), JSON.stringify(filtered))
+        await countKvWrite(env)
+      }
+      // 内容未变 → 保持 KV 原样，不重复写
+    } catch { /* skip */ }
   } else {
-    // 全部健康 → 清理 KV 残留（P2：delete 也计入 countKvWrite）
-    await env.KV.delete(HEALTH_KEY(providerId)).catch(() => {})
-    await countKvWrite(env)
+    // 全部健康 → 清理 KV 残留。
+    // P4（2026-09-08）：delete 必须先确认 KV 里真有值；没有值则 delete 是 no-op，
+    // 既不该写 KV 也不该计入配额（CF 对删除不存在的 key 不计费）。
+    if (!clearedHealthKeys.has(providerId)) {
+      try {
+        const prevRaw = await env.KV.get(HEALTH_KEY(providerId))
+        const prevHad = !!prevRaw && Object.keys(JSON.parse(prevRaw) as HealthMap).length > 0
+        if (prevHad) {
+          await env.KV.delete(HEALTH_KEY(providerId))
+          await countKvWrite(env)
+        }
+        // 无论 KV 里有没有值，本 isolate 都已确认过，标记避免下次重复探测
+        clearedHealthKeys.add(providerId)
+      } catch {
+        clearedHealthKeys.add(providerId)
+      }
+    }
   }
 }
 
@@ -338,10 +393,15 @@ export async function isMemberCoolingDown(env: Env, member: string, providerMap:
   const enabledKeys = (provider.apiKeys || []).filter(k => k.enabled && k.key)
   if (enabledKeys.length === 0) return false
   try {
-    const healthData = await readHealth(env, parsed.providerId)
+    // P3（2026-09-08）：请求内缓存 —— buildRotationOrder 遍历同一 provider 的多个成员时只读一次 KV。
+    let healthData = requestHealthCache.get(parsed.providerId)
+    if (!healthData) {
+      healthData = await readHealth(env, parsed.providerId)
+      requestHealthCache.set(parsed.providerId, healthData)
+    }
     const now = Date.now()
     return enabledKeys.every(k => {
-      const h = healthData[k.key]
+      const h = healthData![k.key]
       return !!(h?.cooldownUntil && h.cooldownUntil > now)
     })
   } catch {
@@ -366,6 +426,8 @@ export async function buildRotationOrder(
   primaryMembers: string[],
   providerMap: Map<string, Provider>,
 ): Promise<{ candidates: Array<{ member: string; idx: number }>; coolingCount: number; startIdx: number }> {
+  // P3（2026-09-08）：每次构建轮转顺序前清空请求内缓存，避免跨请求污染。
+  requestHealthCache.clear()
   const candidates: Array<{ member: string; idx: number }> = []
   const startIdx = primaryMembers.length ? Math.floor(Math.random() * primaryMembers.length) : 0
   const order = Array.from({ length: primaryMembers.length }, (_, k) => {
