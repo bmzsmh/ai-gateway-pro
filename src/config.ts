@@ -28,6 +28,17 @@ export const KEY_HEALTH_MAX_FAILURES = 5
 // 上游给了 Retry-After 就按它冷却（parseRetryAfter 已按 KEY_HEALTH_COOLDOWN_MS 截顶）。
 export const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60 * 1000
 
+// ===== 错误分类冷却矩阵（2026-09-09，参考 m365 Copilot2API account_health.go CooldownForCategory）=====
+// 语义：不同 HTTP 错误代表不同上游状态，冷却时长应分级，而不是一律 failures 累加等 5 次才降权。
+// 原则：401/403 是「key 确定性失效」，重复试无意义 → 直接长冷却，不累加 failures（避免把 key 彻底降权导致自愈丢失）；
+//       5xx/503/408 是「上游过载/抖动」，短冷却 + 累加 failures（可恢复，冷却后自动回归）；
+// 所有时长可通过 Worker 环境变量覆盖（参数配置化，CPA 风格）：
+//   KEY_COOLDOWN_401_MS / KEY_COOLDOWN_403_MS / KEY_COOLDOWN_503_MS / KEY_COOLDOWN_408_MS
+export const KEY_COOLDOWN_401_MS = 10 * 60 * 1000     // 401 认证过期/失效：10min
+export const KEY_COOLDOWN_403_MS = 30 * 60 * 1000     // 403 禁止/封禁：30min（比 401 更重）
+export const KEY_COOLDOWN_503_MS = 30 * 1000          // 503/5xx 过载：30s 短冷却（可恢复）
+export const KEY_COOLDOWN_408_MS = 15 * 1000          // 408 超时：15s 短冷却（可恢复）
+
 // Gateway 请求安全/稳定性默认值；可通过 Worker 环境变量覆盖。
 export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
 export const DEFAULT_MAX_REQUEST_BODY_BYTES = 5 * 1024 * 1024

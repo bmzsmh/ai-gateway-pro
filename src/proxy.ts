@@ -9,6 +9,10 @@ import {
   DEFAULT_MAX_REQUEST_BODY_BYTES,
   MAX_GROUP_SUBREQUEST_BUDGET,
   FAKE_SUCCESS_COOLDOWN_MS,
+  KEY_COOLDOWN_401_MS,
+  KEY_COOLDOWN_403_MS,
+  KEY_COOLDOWN_503_MS,
+  KEY_COOLDOWN_408_MS,
   SAFE_RESOURCE_ID_RE,
   SAFE_MODEL_ID_RE,
   MAX_MODEL_STRING_LENGTH,
@@ -105,6 +109,66 @@ export function applyRateLimitHealth(h: KeyHealth | undefined, retryAfterMs: num
     ...base,
     // failures 保持原值（不累加）——429 不计入降权计数
     failures: base.failures || 0,
+    lastFailed: true,
+    cooldownUntil: now + cooldownMs,
+  }
+}
+
+// ===== 错误分类冷却（2026-09-09，参考 m365 Copilot2API CooldownForCategory）=====
+// 辅助：从 env 读取可覆盖的冷却时长（参数配置化）
+function getEnvCooldownMs(env: Env, key: keyof Env, fallback: number): number {
+  const raw = env[key] as unknown
+  if (typeof raw === 'string' && raw.length > 0) {
+    const parsed = Number.parseInt(raw, 10)
+    if (Number.isFinite(parsed) && parsed > 0) return parsed
+  }
+  return fallback
+}
+
+/**
+ * 错误分类冷却：为 401/403/5xx/408 分配差异化冷却时长。
+ *
+ * 设计依据（m365 实战验证）：
+ *   · 401（认证过期/key 失效）与 403（禁止/封禁）是「key 确定性失效」——
+ *     重复请求只会继续失败，且这类错误**不随上游恢复而恢复**（key 本身坏了）。
+ *     处理：设置较长冷却 + 保留 failures 累积（仍可触达降权），冷却期内 isMemberCoolingDown
+ *     直接跳过该 key → 零无效上游调用。
+ *   · 503/5xx（上游过载）与 408（超时）是「临时抖动」——上游可能 30 秒后就恢复。
+ *     处理：短冷却 + 保留 failures 累积（冷却期满自动回归候选池 → CC 自愈）。
+ *
+ * 与 429 的区别：429 不累加 failures（限流是「额度问题」，冷却后自然恢复）；
+ * 本函数对 401/403/5xx/408 **保留 failures 累积**（这些是「质量问题」，5 次后应降权淘汰）。
+ */
+export function applyClassifiedHealth(
+  env: Env,
+  h: KeyHealth | undefined,
+  status: number,
+  now = Date.now(),
+): KeyHealth {
+  const base = h && typeof h === 'object' ? { ...h } : { failures: 0, lastFailed: false }
+  let cooldownMs: number
+  switch (status) {
+    case 401:
+      cooldownMs = getEnvCooldownMs(env, 'KEY_COOLDOWN_401_MS', KEY_COOLDOWN_401_MS)
+      break
+    case 403:
+      cooldownMs = getEnvCooldownMs(env, 'KEY_COOLDOWN_403_MS', KEY_COOLDOWN_403_MS)
+      break
+    case 503:
+    case 500:
+    case 502:
+    case 504:
+      cooldownMs = getEnvCooldownMs(env, 'KEY_COOLDOWN_503_MS', KEY_COOLDOWN_503_MS)
+      break
+    case 408:
+      cooldownMs = getEnvCooldownMs(env, 'KEY_COOLDOWN_408_MS', KEY_COOLDOWN_408_MS)
+      break
+    default:
+      cooldownMs = KEY_HEALTH_COOLDOWN_MS
+  }
+  return {
+    ...base,
+    failures: (base.failures || 0) + 1,
     lastFailed: true,
     cooldownUntil: now + cooldownMs,
   }
@@ -854,7 +918,11 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
         }
 
         if (response.status === 401 || response.status === 403 || response.status >= 500 || response.status === 408) {
-          healthData[apiKey] = markKeyFailure(healthData[apiKey])
+          // 2026-09-09：错误分类冷却（参考 m365 CooldownForCategory）
+          // 401/403 → 长冷却（10min/30min，key 确定性失效，避免反复试坏 key）
+          // 5xx/503/408 → 短冷却（30s/15s，上游临时抖动，冷却后自动回归）
+          // 保留 failures 累积（质量问题 5 次后降权淘汰），同时设 cooldownUntil 立即隔离
+          healthData[apiKey] = applyClassifiedHealth(c.env, healthData[apiKey], response.status)
           healthUpdated = true
           lastError = response
           continue

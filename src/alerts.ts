@@ -180,7 +180,7 @@ export function detectMultimodalFailure(status: number, bodyText: string): strin
   return null
 }
 
-// ===== KV 写计数器（每次读 KV 检查阈值，每 20 次写回持久化） =====
+// ===== KV 写计数器（buffer 20 才读+写，2026-09-09 优化） =====
 let kvWriteBuffer = 0
 
 export async function countKvWrite(env: Env): Promise<void> {
@@ -188,7 +188,12 @@ export async function countKvWrite(env: Env): Promise<void> {
   const today = new Date().toISOString().slice(0, 10)
   const key = `alert:kv_count:${today}`
 
-  // 每次调用都检查阈值（读 KV 获取已持久化的计数）
+  // 2026-09-09 优化：buffer 未满 20 时完全不碰 KV（原来每次调用都 KV.get 检查阈值，
+  // 失败风暴时 countKvWrite 被高频调用 → 每次 KV.get 放大 → CPU 尖峰 → 1102 元凶之一）。
+  // 现在攒满 20 次才读+写（含阈值检查），把 KV 读放大降到 1/20。
+  if (kvWriteBuffer < 20) return
+
+  // 每 20 次批量读+写（含阈值检查）
   try {
     const raw = await env.KV.get(key)
     const stored = raw ? parseInt(raw, 10) : 0
@@ -208,17 +213,11 @@ export async function countKvWrite(env: Env): Promise<void> {
         )
       }
     }
-  } catch { /* skip */ }
 
-  // 每 20 次批量写回 KV（减少写入次数）
-  if (kvWriteBuffer >= 20) {
-    try {
-      const raw = await env.KV.get(key)
-      const count = raw ? parseInt(raw, 10) + kvWriteBuffer : kvWriteBuffer
-      await env.KV.put(key, String(count), { expirationTtl: 86400 * 2 })
-      kvWriteBuffer = 0
-    } catch { /* skip */ }
-  }
+    // 批量写回 KV
+    await env.KV.put(key, String(total), { expirationTtl: 86400 * 2 })
+    kvWriteBuffer = 0
+  } catch { /* skip */ }
 }
 
 // ===== 获取告警历史 =====
