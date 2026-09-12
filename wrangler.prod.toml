@@ -9,4 +9,6 @@ usage_model = "standard"
 
 [[kv_namespaces]]
 binding = "KV"
-id = " <YOUR_PROD_KV_NAMESPACE_ID>"
+# 请替换 <YOUR_PROD_KV_NAMESPACE_ID> 为你的实际生产 KV namespace ID
+# 也可以通过 GitHub Actions vars.KV_NAMESPACE_ID 注入（见 .github/workflows/deploy.yml）
+id = "<YOUR_PROD_KV_NAMESPACE_ID>"
