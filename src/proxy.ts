@@ -334,7 +334,10 @@ async function parseProxyBody(c: Context<{ Bindings: Env }>): Promise<ProxyReque
   }
   if (!raw.trim()) return {}
   try {
-    return JSON.parse(raw) as ProxyRequestBody
+    const parsed = JSON.parse(raw) as ProxyRequestBody
+    // CPU 优化（2026-09-12）：缓存原始 raw，零拷贝转发时复用（避免大 body 二次 stringify）
+    ;(parsed as ProxyRequestBody & { __rawBody?: string }).__rawBody = raw
+    return parsed
   } catch {
     throw new InvalidJsonError('请求体不是合法 JSON')
   }
@@ -409,7 +412,6 @@ export async function isMemberCoolingDown(env: Env, member: string, providerMap:
       return !!(h?.cooldownUntil && h.cooldownUntil > now)
     })
   } catch {
-    // 读失败不阻断（视为未冷却，宁可多试一次也不误跳过）
     return false
   }
 }
@@ -417,13 +419,11 @@ export async function isMemberCoolingDown(env: Env, member: string, providerMap:
 /**
  * S1（2026-09-06）随机轮转候选构建 —— 回归上游原版 `Math.random()` 起点语义。
  *
- * 与被删除的 A4 顺序指针版的差异：
- *   · 起点 = Math.floor(Math.random() * members.length)，**无 KV 读、无 KV 写**
- *   · 仍然环形扫描全部成员，并**排除**全 key 冷却中的成员（A3 429 精确冷却在此生效）
- *   · 若全部冷却 → candidates 为空 → 调用方直接走 backup 组降级
- *
- * 为什么随机能解决锁死：坏成员被选中的概率是 1/N 而不是 100%，
- * 任何单成员故障（包含无法被状态码识别的「200 假成功」黑洞）都无法持久占据全部流量。
+ * CPU 优化（2026-09-12）：批量冷却检查。
+ * 原实现：对每个成员串行调用 isMemberCoolingDown → 每成员 1 次 KV.get + JSON.parse。
+ * N 个成员 = N 次串行 KV 读，是 1102 CPU 超限的根因之一。
+ * 现实现：收集去重 providerId，并行读取每个 provider 的 health（1 次/provider），
+ * 然后在内存中判定冷却。KV 读次数从 N 降到 P（P = 去重 provider 数，通常 ≤ 3）。
  */
 export async function buildRotationOrder(
   env: Env,
@@ -433,10 +433,41 @@ export async function buildRotationOrder(
   const candidates: Array<{ member: string; idx: number }> = []
   let coolingCount = 0
   const startIdx = primaryMembers.length ? Math.floor(Math.random() * primaryMembers.length) : 0
+
+  // 批量预取：收集所有成员涉及的 providerId，去重后并行读 health
+  const providerIds = new Set<string>()
+  for (const member of primaryMembers) {
+    const parsed = parseModelId(member)
+    if (parsed) providerIds.add(parsed.providerId)
+  }
+  const healthMap = new Map<string, HealthMap>()
+  const now = Date.now()
+  await Promise.all(
+    Array.from(providerIds).map(async (pid) => {
+      try {
+        healthMap.set(pid, await readHealth(env, pid))
+      } catch {
+        healthMap.set(pid, {} as HealthMap)
+      }
+    })
+  )
+
+  // 在内存中判定冷却，无额外 KV 读
   for (let k = 0; k < primaryMembers.length; k++) {
     const idx = (startIdx + k) % primaryMembers.length
     const member = primaryMembers[idx]
-    if (await isMemberCoolingDown(env, member, providerMap)) coolingCount++
+    const parsed = parseModelId(member)
+    if (!parsed) { candidates.push({ member, idx }); continue }
+    const provider = providerMap.get(parsed.providerId)
+    if (!provider) { candidates.push({ member, idx }); continue }
+    const enabledKeys = (provider.apiKeys || []).filter(k => k.enabled && k.key)
+    if (enabledKeys.length === 0) { candidates.push({ member, idx }); continue }
+    const healthData = healthMap.get(parsed.providerId) || {}
+    const allCooling = enabledKeys.every(k => {
+      const h = healthData[k.key]
+      return !!(h?.cooldownUntil && h.cooldownUntil > now)
+    })
+    if (allCooling) coolingCount++
     else candidates.push({ member, idx })
   }
   return { candidates, coolingCount, startIdx }
@@ -695,12 +726,20 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
     if (!modelConfig.enabled) return c.json({ error: { message: `模型 "${modelId}" 已禁用`, type: 'model_disabled', request_id: requestId } }, 403)
 
     const enabledKeys = provider.apiKeys.filter(k => k.enabled && k.key)
-    const forwardBody = { ...body, model: modelId }
+    // CPU 优化（2026-09-12）：零拷贝转发。
+    // 原实现 `{ ...body, model: modelId }` 展开大 body + JSON.stringify(forwardBody) = 两次大对象操作。
+    // 若 body.model === modelId（组路由透传成员模型时通常一致），直接复用原始 raw 字符串，零序列化。
+    const rawBody = (body as ProxyRequestBody & { __rawBody?: string }).__rawBody
+    const bodyModelSame = body.model === modelId
+    const forwardBody = bodyModelSame && rawBody ? body : { ...body, model: modelId }
+    const forwardBodyStr = bodyModelSame && rawBody
+      ? rawBody
+      : JSON.stringify(forwardBody)
     const url = new URL(c.req.url)
     const subPath = url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
     const timeoutMs = getRequestTimeoutMs(c.env)
     // S6（2026-09-06）：上移到此处，让 opencode 分支也能用（原先声明在 opencode 分支之后）。
-    const isStreamRequest = !!(forwardBody as { stream?: unknown }).stream
+    const isStreamRequest = !!(body as { stream?: unknown }).stream || !!(forwardBody as { stream?: unknown }).stream
 
     if (isOpenCodeProvider(providerId)) {
       const response = await proxyOpenCodeRequest({
@@ -709,7 +748,7 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
         method: c.req.method,
         subPath,
         search: url.search,
-        body: JSON.stringify(forwardBody),
+        body: forwardBodyStr,
         mirrorUrls: resolveOpenCodeUrls(c.env),
         timeoutMs,
       })
@@ -727,7 +766,7 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
        * 处理：命中 error → 记 markKeyFailure 并返回 502，让组路由的 tryMember 看到 >=400
        * 继续换下一个成员；未命中 → 首块拼回流原样透传。
        */
-      if ((isStreamRequest || isSseResponse(response)) && response.ok && response.body) {
+      if ((isStreamRequest || isSseResponse(response)) && response.ok && response.body && c.env.FAKE_SUCCESS_PROBE === 'on') {
         const probe = await probeStreamHead(response)
         if (!probe || probe.isError) {
           try { await probe?.reader.cancel() } catch { /* ignore */ }
@@ -829,7 +868,7 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
         const response = await fetch(forwardUrl, {
           method: c.req.method,
           headers: forwardHeaders,
-          body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : JSON.stringify(forwardBody),
+          body: c.req.method === 'GET' || c.req.method === 'HEAD' ? undefined : forwardBodyStr,
           signal: AbortSignal.timeout(effectiveTimeoutMs),
         })
 
@@ -837,7 +876,12 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
           // —— S4（2026-09-06）：流式请求先探测首包，识破「HTTP 200 + 流内 error」假成功 ——
           // S8（2026-09-06）：门槛改为「请求声明 stream **或** 响应 content-type 是 SSE」，
           // 因为 AMD 类上游在 stream:false 时同样返回 SSE + event: error（实测 6/6）。
-          if ((isStreamRequest || isSseResponse(response)) && response.body) {
+          // CPU 优化（2026-09-12）：FAKE_SUCCESS_PROBE 开关，默认关闭。
+          // 关闭时跳过 probeStreamHead（每响应一次 TextDecoder.decode + 拼流），
+          // 成功响应直接透传，消除最大 CPU 热点。
+          // 开启时恢复完整假成功探测逻辑（不变）。
+          const probeEnabled = c.env.FAKE_SUCCESS_PROBE === 'on'
+          if (probeEnabled && (isStreamRequest || isSseResponse(response)) && response.body) {
             const probe = await probeStreamHead(response)
             if (!probe) {
               // 首包读取失败：按该 key 失败处理，继续下一个 key
@@ -887,7 +931,7 @@ async function forwardToProviderModel(c: Context<{ Bindings: Env }>, providerId:
             healthUpdated = true
           }
           // —— 多模态"假成功"检测：200 但模型未识别图片 / reasoning token 预算不足 ——
-          if (!isStreamRequest && hasImageContent(forwardBody)) {
+          if (!isStreamRequest && hasImageContent(forwardBody) && c.env.FAKE_SUCCESS_PROBE === 'on') {
             safeWaitUntil(c, (async () => {
               try {
                 const bodyText = await response.clone().text()

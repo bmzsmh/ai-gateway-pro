@@ -124,4 +124,6 @@ export interface Env {
   KEY_COOLDOWN_403_MS?: string
   KEY_COOLDOWN_503_MS?: string
   KEY_COOLDOWN_408_MS?: string
+  // 2026-09-12：假成功探测开关（默认关闭，省 CPU）
+  FAKE_SUCCESS_PROBE?: string
 }
