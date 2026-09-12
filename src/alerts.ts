@@ -89,7 +89,7 @@ async function sendTg(env: Env, text: string): Promise<boolean> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id: env.TG_CHAT_ID || '8030792418',
+        chat_id: env.TG_CHAT_ID,
         text,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
